@@ -22,6 +22,10 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
+# 系统托盘
+import pystray
+from PIL import Image, ImageDraw
+
 # ==================== 配置管理 ====================
 CONFIG_FILE = Path(__file__).parent / "config.json"
 DEFAULT_CONFIG = {
@@ -276,7 +280,7 @@ class MailAttachmentTool:
 
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("邮件附件下载 & 定时发送工具 v2.0")
+        self.root.title("邮件附件下载 & 定时发送工具 v2.1")
         self.root.geometry("700x720")
         self.root.resizable(True, True)
 
@@ -284,6 +288,7 @@ class MailAttachmentTool:
         self.running = False
         self.stop_event = threading.Event()
         self.scheduler_thread = None
+        self.tray_icon = None  # 托盘图标
 
         self._build_ui()
         self._load_config_to_ui()
@@ -1006,11 +1011,58 @@ class MailAttachmentTool:
         self.log_text.delete(1.0, tk.END)
         self.log_text.config(state=tk.DISABLED)
 
-    # ---------- 关闭 ----------
-    def on_close(self):
+    # ---------- 系统托盘 ----------
+    def _create_tray_image(self):
+        """生成托盘图标（信封图案）"""
+        img = Image.new("RGB", (64, 64), (0, 120, 212))
+        draw = ImageDraw.Draw(img)
+        # 信封主体
+        draw.rectangle([8, 18, 56, 46], fill="white", outline="white")
+        # 信封三角折角
+        draw.polygon([(8, 18), (32, 32), (56, 18)], fill=(0, 120, 212))
+        draw.polygon([(8, 46), (32, 32), (56, 46)], fill="white")
+        # @符号
+        draw.ellipse([20, 22, 44, 42], outline=(0, 120, 212), width=2)
+        draw.text((24, 26), "M", fill=(0, 120, 212))
+        return img
+
+    def _show_window(self, icon=None):
+        """显示主窗口"""
+        self.root.after(0, self._restore_window)
+
+    def _restore_window(self):
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    def _hide_to_tray(self):
+        """最小化到托盘"""
+        self.root.withdraw()
+        if self.tray_icon is None:
+            self.tray_icon = pystray.Icon(
+                "mail_tool",
+                self._create_tray_image(),
+                "邮件附件下载工具",
+                menu=pystray.Menu(
+                    pystray.MenuItem("显示窗口", self._show_window, default=True),
+                    pystray.MenuItem("退出程序", self._tray_exit)
+                )
+            )
+            threading.Thread(target=self.tray_icon.run, daemon=True).start()
+
+    def _tray_exit(self, icon=None):
+        """从托盘退出程序"""
+        if self.tray_icon:
+            self.tray_icon.stop()
         if self.running:
             self._stop_scheduler()
-        self.root.destroy()
+        self.root.after(0, self.root.destroy)
+
+    # ---------- 关闭 ----------
+    def on_close(self):
+        """关闭窗口 → 最小化到托盘"""
+        self.log(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 窗口已最小化到系统托盘，程序在后台运行中")
+        self._hide_to_tray()
 
     def run(self):
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
