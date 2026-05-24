@@ -188,12 +188,11 @@ def fetch_attachments(mail, sender_filter_list, save_folder, log_func):
                             if filename:
                                 filename = clean_filename(decode_str(filename))
                                 filepath = os.path.join(save_folder, filename)
-                                # 处理重名
-                                counter = 1
-                                base, ext = os.path.splitext(filename)
-                                while os.path.exists(filepath):
-                                    filepath = os.path.join(save_folder, f"{base}_{counter}{ext}")
-                                    counter += 1
+                                # 处理重名：追加下载时间戳
+                                if os.path.exists(filepath):
+                                    base, ext = os.path.splitext(filename)
+                                    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                                    filepath = os.path.join(save_folder, f"{base}_{ts}{ext}")
                                 with open(filepath, "wb") as f:
                                     f.write(part.get_payload(decode=True))
                                 log_func(f"    -> 已下载: {os.path.basename(filepath)}")
@@ -207,11 +206,10 @@ def fetch_attachments(mail, sender_filter_list, save_folder, log_func):
                         if filename:
                             filename = clean_filename(decode_str(filename))
                             filepath = os.path.join(save_folder, filename)
-                            counter = 1
-                            base, ext = os.path.splitext(filename)
-                            while os.path.exists(filepath):
-                                filepath = os.path.join(save_folder, f"{base}_{counter}{ext}")
-                                counter += 1
+                            if os.path.exists(filepath):
+                                base, ext = os.path.splitext(filename)
+                                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                                filepath = os.path.join(save_folder, f"{base}_{ts}{ext}")
                             with open(filepath, "wb") as f:
                                 f.write(msg.get_payload(decode=True))
                             log_func(f"    -> 已下载: {os.path.basename(filepath)}")
@@ -286,8 +284,8 @@ class MailAttachmentTool:
 
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("邮件附件下载 & 定时发送工具 v2.1")
-        self.root.geometry("700x720")
+        self.root.title("邮件附件下载 & 定时发送工具 v3.0")
+        self.root.geometry("700x620")
         self.root.resizable(True, True)
 
         self.config = load_config()
@@ -309,7 +307,7 @@ class MailAttachmentTool:
         main_frame.pack(fill=tk.BOTH, expand=True)
 
         # --- 标题 ---
-        title = ttk.Label(main_frame, text="邮件附件自动下载工具",
+        title = ttk.Label(main_frame, text="邮件附件下载 & 定时发送工具",
                           font=("Microsoft YaHei", 14, "bold"))
         title.pack(pady=(0, 10))
 
@@ -317,253 +315,248 @@ class MailAttachmentTool:
         notebook = ttk.Notebook(main_frame)
         notebook.pack(fill=tk.BOTH, expand=True)
 
-        # === Tab 1: 邮件配置 ===
-        tab_mail = ttk.Frame(notebook, padding=10)
-        notebook.add(tab_mail, text="邮件配置")
+        # ================================================================
+        # Tab 1: 下载配置（IMAP + 定时）
+        # ================================================================
+        tab_dl = ttk.Frame(notebook, padding=10)
+        notebook.add(tab_dl, text="下载配置")
+
+        dl_inner = ttk.Frame(tab_dl)
+        dl_inner.pack(fill=tk.BOTH, expand=True)
+        dl_inner.columnconfigure(1, weight=1)
 
         row = 0
-        ttk.Label(tab_mail, text="IMAP服务器:").grid(row=row, column=0, sticky=tk.W, pady=3)
-        self.entry_server = ttk.Entry(tab_mail, width=35)
-        self.entry_server.grid(row=row, column=1, sticky=tk.W, pady=3, padx=(5, 0))
-        ttk.Label(tab_mail, text="(如: imap.qq.com / imap.163.com / imap.gmail.com)",
-                  foreground="gray").grid(row=row, column=2, sticky=tk.W, pady=3, padx=5)
+        # --- 服务器 ---
+        ttk.Label(dl_inner, text="IMAP服务器:").grid(row=row, column=0, sticky=tk.W, pady=2)
+        self.entry_server = ttk.Entry(dl_inner, width=35)
+        self.entry_server.grid(row=row, column=1, sticky=tk.W, pady=2, padx=(5, 0))
+        ttk.Label(dl_inner, text="(如: imap.qq.com / imap.163.com)", foreground="gray").grid(
+            row=row, column=2, sticky=tk.W, pady=2, padx=5)
         row += 1
 
-        ttk.Label(tab_mail, text="IMAP端口:").grid(row=row, column=0, sticky=tk.W, pady=3)
-        self.entry_port = ttk.Entry(tab_mail, width=10)
-        self.entry_port.grid(row=row, column=1, sticky=tk.W, pady=3, padx=(5, 0))
-        ttk.Label(tab_mail, text="(SSL: 993, 非SSL: 143)", foreground="gray").grid(row=row, column=2, sticky=tk.W, pady=3, padx=5)
+        ttk.Label(dl_inner, text="IMAP端口:").grid(row=row, column=0, sticky=tk.W, pady=2)
+        self.entry_port = ttk.Entry(dl_inner, width=10)
+        self.entry_port.grid(row=row, column=1, sticky=tk.W, pady=2, padx=(5, 0))
+        ttk.Label(dl_inner, text="(SSL: 993)", foreground="gray").grid(
+            row=row, column=2, sticky=tk.W, pady=2, padx=5)
         row += 1
 
-        ttk.Label(tab_mail, text="邮箱账号:").grid(row=row, column=0, sticky=tk.W, pady=3)
-        self.entry_user = ttk.Entry(tab_mail, width=35)
-        self.entry_user.grid(row=row, column=1, sticky=tk.W, pady=3, padx=(5, 0))
+        ttk.Label(dl_inner, text="邮箱账号:").grid(row=row, column=0, sticky=tk.W, pady=2)
+        self.entry_user = ttk.Entry(dl_inner, width=35)
+        self.entry_user.grid(row=row, column=1, sticky=tk.W, pady=2, padx=(5, 0))
         row += 1
 
-        ttk.Label(tab_mail, text="密码/授权码:").grid(row=row, column=0, sticky=tk.W, pady=3)
-        self.entry_pass = ttk.Entry(tab_mail, width=35, show="*")
-        self.entry_pass.grid(row=row, column=1, sticky=tk.W, pady=3, padx=(5, 0))
-        ttk.Label(tab_mail, text="(QQ/163需使用授权码，非登录密码)", foreground="red").grid(
-            row=row, column=2, sticky=tk.W, pady=3, padx=5)
+        ttk.Label(dl_inner, text="密码/授权码:").grid(row=row, column=0, sticky=tk.W, pady=2)
+        self.entry_pass = ttk.Entry(dl_inner, width=35, show="*")
+        self.entry_pass.grid(row=row, column=1, sticky=tk.W, pady=2, padx=(5, 0))
         row += 1
 
         self.var_skip_ssl = tk.BooleanVar()
-        self.cb_skip_ssl = ttk.Checkbutton(tab_mail, text="跳过SSL证书验证（内网自签名证书/Coremail须勾选）",
+        self.cb_skip_ssl = ttk.Checkbutton(dl_inner, text="跳过SSL证书验证（内网自签名/Coremail须勾选）",
                                            variable=self.var_skip_ssl)
-        self.cb_skip_ssl.grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=3)
+        self.cb_skip_ssl.grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=2)
         row += 1
 
-        ttk.Separator(tab_mail, orient=tk.HORIZONTAL).grid(row=row, column=0, columnspan=3,
-                                                           sticky=tk.EW, pady=10)
+        ttk.Separator(dl_inner, orient=tk.HORIZONTAL).grid(row=row, column=0, columnspan=3,
+                                                            sticky=tk.EW, pady=8)
         row += 1
 
-        ttk.Label(tab_mail, text="发件人筛选:").grid(row=row, column=0, sticky=tk.W, pady=3)
-        self.entry_sender = ttk.Entry(tab_mail, width=35)
-        self.entry_sender.grid(row=row, column=1, sticky=tk.W, pady=3, padx=(5, 0))
-        ttk.Label(tab_mail, text="(多人请用英文逗号分隔，支持邮箱或姓名模糊匹配)", foreground="gray").grid(
-            row=row, column=2, sticky=tk.W, pady=3, padx=5)
+        ttk.Label(dl_inner, text="发件人筛选:").grid(row=row, column=0, sticky=tk.W, pady=2)
+        self.entry_sender = ttk.Entry(dl_inner, width=35)
+        self.entry_sender.grid(row=row, column=1, sticky=tk.W, pady=2, padx=(5, 0))
+        ttk.Label(dl_inner, text="(英文逗号分隔，支持邮箱或姓名模糊匹配)", foreground="gray").grid(
+            row=row, column=2, sticky=tk.W, pady=2, padx=5)
         row += 1
 
-        ttk.Label(tab_mail, text="保存目录:").grid(row=row, column=0, sticky=tk.W, pady=3)
-        folder_frame = ttk.Frame(tab_mail)
-        folder_frame.grid(row=row, column=1, columnspan=2, sticky=tk.EW, pady=3, padx=(5, 0))
+        ttk.Label(dl_inner, text="保存目录:").grid(row=row, column=0, sticky=tk.W, pady=2)
+        folder_frame = ttk.Frame(dl_inner)
+        folder_frame.grid(row=row, column=1, columnspan=2, sticky=tk.EW, pady=2, padx=(5, 0))
         self.entry_folder = ttk.Entry(folder_frame, width=30)
         self.entry_folder.pack(side=tk.LEFT)
         ttk.Button(folder_frame, text="浏览...", command=self._browse_folder,
                    width=8).pack(side=tk.LEFT, padx=5)
-
         row += 1
-        ttk.Separator(tab_mail, orient=tk.HORIZONTAL).grid(row=row, column=0, columnspan=3,
-                                                           sticky=tk.EW, pady=10)
+
+        ttk.Separator(dl_inner, orient=tk.HORIZONTAL).grid(row=row, column=0, columnspan=3,
+                                                            sticky=tk.EW, pady=8)
         row += 1
-        ttk.Button(tab_mail, text="测试连接 & 立即执行一次", command=self._test_and_run,
-                   width=25).grid(row=row, column=0, columnspan=3, pady=5)
 
-        # 保留列扩展
-        tab_mail.columnconfigure(1, weight=1)
+        # --- 下载定时 ---
+        ttk.Label(dl_inner, text="定时设置",
+                  font=("", 10, "bold")).grid(row=row, column=0, columnspan=3, sticky=tk.W)
+        row += 1
 
-        # === Tab 2: 下载定时 ===
-        tab_schedule = ttk.Frame(notebook, padding=10)
-        notebook.add(tab_schedule, text="下载定时")
-
-        # 启用开关
         self.var_dl_enabled = tk.BooleanVar(value=True)
-        self.cb_dl_enabled = ttk.Checkbutton(tab_schedule, text="启用附件下载定时任务",
+        self.cb_dl_enabled = ttk.Checkbutton(dl_inner, text="启用定时下载",
                                              variable=self.var_dl_enabled)
-        self.cb_dl_enabled.pack(anchor=tk.W)
-
-        ttk.Separator(tab_schedule, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
+        self.cb_dl_enabled.grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=2)
+        row += 1
 
         # 星期选择
-        ttk.Label(tab_schedule, text="执行日期（可多选）:",
-                  font=("", 10, "bold")).pack(anchor=tk.W)
-        day_frame = ttk.Frame(tab_schedule)
-        day_frame.pack(fill=tk.X, pady=5)
+        dl_day_frame = ttk.Frame(dl_inner)
+        dl_day_frame.grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=2)
         self.day_vars = []
-        self.day_cbs = []
         for i, name in enumerate(self.WEEKDAY_NAMES):
             var = tk.BooleanVar()
             self.day_vars.append(var)
-            cb = ttk.Checkbutton(day_frame, text=name, variable=var)
-            cb.pack(side=tk.LEFT, padx=5)
-            self.day_cbs.append(cb)
+            ttk.Checkbutton(dl_day_frame, text=name, variable=var).pack(side=tk.LEFT, padx=4)
+        row += 1
 
-        # 时间设置
-        ttk.Separator(tab_schedule, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
-        ttk.Label(tab_schedule, text="执行时间:", font=("", 10, "bold")).pack(anchor=tk.W, pady=(0, 5))
+        # 时间
+        dl_time_frame = ttk.Frame(dl_inner)
+        dl_time_frame.grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=2)
+        ttk.Label(dl_time_frame, text="时").pack(side=tk.LEFT)
+        self.spin_hour = ttk.Spinbox(dl_time_frame, from_=0, to=23, width=4, justify=tk.CENTER)
+        self.spin_hour.pack(side=tk.LEFT, padx=(2, 5)); self.spin_hour.set("9")
+        ttk.Label(dl_time_frame, text="分").pack(side=tk.LEFT)
+        self.spin_min = ttk.Spinbox(dl_time_frame, from_=0, to=59, width=4, justify=tk.CENTER)
+        self.spin_min.pack(side=tk.LEFT, padx=(2, 5)); self.spin_min.set("0")
+        ttk.Label(dl_time_frame, text="秒").pack(side=tk.LEFT)
+        self.spin_sec = ttk.Spinbox(dl_time_frame, from_=0, to=59, width=4, justify=tk.CENTER)
+        self.spin_sec.pack(side=tk.LEFT, padx=(2, 5)); self.spin_sec.set("0")
+        row += 1
 
-        time_frame = ttk.Frame(tab_schedule)
-        time_frame.pack(fill=tk.X)
+        ttk.Button(dl_inner, text="测试连接 & 立即执行一次", command=self._test_and_run,
+                   width=25).grid(row=row, column=0, columnspan=3, pady=8)
 
-        ttk.Label(time_frame, text="时:").pack(side=tk.LEFT)
-        self.spin_hour = ttk.Spinbox(time_frame, from_=0, to=23, width=5, justify=tk.CENTER)
-        self.spin_hour.pack(side=tk.LEFT, padx=(2, 10))
-        self.spin_hour.set("9")
-
-        ttk.Label(time_frame, text="分:").pack(side=tk.LEFT)
-        self.spin_min = ttk.Spinbox(time_frame, from_=0, to=59, width=5, justify=tk.CENTER)
-        self.spin_min.pack(side=tk.LEFT, padx=(2, 10))
-        self.spin_min.set("0")
-
-        ttk.Label(time_frame, text="秒:").pack(side=tk.LEFT)
-        self.spin_sec = ttk.Spinbox(time_frame, from_=0, to=59, width=5, justify=tk.CENTER)
-        self.spin_sec.pack(side=tk.LEFT, padx=(2, 10))
-        self.spin_sec.set("0")
-
-        ttk.Label(tab_schedule, text="(每天在指定时分秒检查一次，只有选中的星期才执行)",
-                  foreground="gray").pack(anchor=tk.W, pady=(5, 10))
-
-        # === Tab 3: 邮件发送 ===
+        # ================================================================
+        # Tab 2: 发送配置（SMTP + 定时）
+        # ================================================================
         tab_send = ttk.Frame(notebook, padding=10)
-        notebook.add(tab_send, text="邮件发送")
+        notebook.add(tab_send, text="发送配置")
 
-        # 启用开关
-        self.var_sd_enabled = tk.BooleanVar(value=False)
-        self.cb_sd_enabled = ttk.Checkbutton(tab_send, text="启用邮件定时发送",
-                                             variable=self.var_sd_enabled)
-        self.cb_sd_enabled.pack(anchor=tk.W)
-
-        ttk.Separator(tab_send, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
-
-        # grid 内容放到子 Frame 中，避免与 pack 冲突
         send_inner = ttk.Frame(tab_send)
         send_inner.pack(fill=tk.BOTH, expand=True)
+        send_inner.columnconfigure(1, weight=1)
 
-        # SMTP配置
         srow = 0
-        ttk.Label(send_inner, text="SMTP服务器:").grid(row=srow, column=0, sticky=tk.W, pady=3)
+        # --- SMTP服务器 ---
+        ttk.Label(send_inner, text="SMTP服务器:").grid(row=srow, column=0, sticky=tk.W, pady=2)
         self.entry_smtp_server = ttk.Entry(send_inner, width=35)
-        self.entry_smtp_server.grid(row=srow, column=1, sticky=tk.W, pady=3, padx=(5, 0))
-        ttk.Label(send_inner, text="(如: smtp.qq.com / smtp.163.com)",
-                  foreground="gray").grid(row=srow, column=2, sticky=tk.W, pady=3, padx=5)
+        self.entry_smtp_server.grid(row=srow, column=1, sticky=tk.W, pady=2, padx=(5, 0))
+        ttk.Label(send_inner, text="(如: smtp.qq.com / smtp.163.com)", foreground="gray").grid(
+            row=srow, column=2, sticky=tk.W, pady=2, padx=5)
         srow += 1
 
-        ttk.Label(send_inner, text="SMTP端口:").grid(row=srow, column=0, sticky=tk.W, pady=3)
+        ttk.Label(send_inner, text="SMTP端口:").grid(row=srow, column=0, sticky=tk.W, pady=2)
         self.entry_smtp_port = ttk.Entry(send_inner, width=10)
-        self.entry_smtp_port.grid(row=srow, column=1, sticky=tk.W, pady=3, padx=(5, 0))
+        self.entry_smtp_port.grid(row=srow, column=1, sticky=tk.W, pady=2, padx=(5, 0))
         self.var_smtp_ssl = tk.BooleanVar(value=True)
-        self.cb_smtp_ssl = ttk.Checkbutton(send_inner, text="使用SSL", variable=self.var_smtp_ssl)
-        self.cb_smtp_ssl.grid(row=srow, column=2, sticky=tk.W, pady=3, padx=5)
+        ttk.Checkbutton(send_inner, text="使用SSL", variable=self.var_smtp_ssl).grid(
+            row=srow, column=2, sticky=tk.W, pady=2, padx=5)
         srow += 1
 
-        ttk.Label(send_inner, text="发件人账号:").grid(row=srow, column=0, sticky=tk.W, pady=3)
+        self.var_skip_ssl_smtp = tk.BooleanVar(value=False)
+        ttk.Checkbutton(send_inner, text="跳过SSL证书验证（内网自签名证书须勾选）",
+                        variable=self.var_skip_ssl_smtp).grid(
+            row=srow, column=0, columnspan=3, sticky=tk.W, pady=2)
+        srow += 1
+
+        ttk.Label(send_inner, text="发件人账号:").grid(row=srow, column=0, sticky=tk.W, pady=2)
         self.entry_send_user = ttk.Entry(send_inner, width=35)
-        self.entry_send_user.grid(row=srow, column=1, sticky=tk.W, pady=3, padx=(5, 0))
-        ttk.Label(send_inner, text="(默认复用下载页的邮箱账号)", foreground="gray").grid(
-            row=srow, column=2, sticky=tk.W, pady=3, padx=5)
+        self.entry_send_user.grid(row=srow, column=1, sticky=tk.W, pady=2, padx=(5, 0))
+        ttk.Label(send_inner, text="(空则复用下载页邮箱)", foreground="gray").grid(
+            row=srow, column=2, sticky=tk.W, pady=2, padx=5)
         srow += 1
 
-        ttk.Label(send_inner, text="发件人密码:").grid(row=srow, column=0, sticky=tk.W, pady=3)
+        ttk.Label(send_inner, text="发件人密码:").grid(row=srow, column=0, sticky=tk.W, pady=2)
         self.entry_send_pass = ttk.Entry(send_inner, width=35, show="*")
-        self.entry_send_pass.grid(row=srow, column=1, sticky=tk.W, pady=3, padx=(5, 0))
-        ttk.Label(send_inner, text="(默认复用下载页的密码)", foreground="gray").grid(
-            row=srow, column=2, sticky=tk.W, pady=3, padx=5)
+        self.entry_send_pass.grid(row=srow, column=1, sticky=tk.W, pady=2, padx=(5, 0))
+        ttk.Label(send_inner, text="(空则复用下载页密码)", foreground="gray").grid(
+            row=srow, column=2, sticky=tk.W, pady=2, padx=5)
         srow += 1
 
         ttk.Separator(send_inner, orient=tk.HORIZONTAL).grid(row=srow, column=0, columnspan=3,
-                                                           sticky=tk.EW, pady=10)
+                                                              sticky=tk.EW, pady=8)
         srow += 1
 
-        ttk.Label(send_inner, text="收件人:").grid(row=srow, column=0, sticky=tk.W, pady=3)
+        ttk.Label(send_inner, text="收件人:").grid(row=srow, column=0, sticky=tk.W, pady=2)
         self.entry_send_to = ttk.Entry(send_inner, width=35)
-        self.entry_send_to.grid(row=srow, column=1, sticky=tk.W, pady=3, padx=(5, 0))
+        self.entry_send_to.grid(row=srow, column=1, sticky=tk.W, pady=2, padx=(5, 0))
         ttk.Label(send_inner, text="(多人用英文逗号分隔)", foreground="gray").grid(
-            row=srow, column=2, sticky=tk.W, pady=3, padx=5)
+            row=srow, column=2, sticky=tk.W, pady=2, padx=5)
         srow += 1
 
-        ttk.Label(send_inner, text="邮件主题:").grid(row=srow, column=0, sticky=tk.W, pady=3)
+        ttk.Label(send_inner, text="邮件主题:").grid(row=srow, column=0, sticky=tk.W, pady=2)
         self.entry_send_subject = ttk.Entry(send_inner, width=35)
-        self.entry_send_subject.grid(row=srow, column=1, sticky=tk.W, pady=3, padx=(5, 0))
+        self.entry_send_subject.grid(row=srow, column=1, sticky=tk.W, pady=2, padx=(5, 0))
         srow += 1
 
-        ttk.Label(send_inner, text="邮件正文:").grid(row=srow, column=0, sticky=tk.NW, pady=3)
-        self.text_send_body = tk.Text(send_inner, width=35, height=4)
-        self.text_send_body.grid(row=srow, column=1, sticky=tk.W, pady=3, padx=(5, 0))
+        ttk.Label(send_inner, text="邮件正文:").grid(row=srow, column=0, sticky=tk.NW, pady=2)
+        self.text_send_body = tk.Text(send_inner, width=35, height=3)
+        self.text_send_body.grid(row=srow, column=1, sticky=tk.W, pady=2, padx=(5, 0))
         srow += 1
 
-        ttk.Label(send_inner, text="附件:").grid(row=srow, column=0, sticky=tk.NW, pady=3)
+        # 附件
+        ttk.Label(send_inner, text="附件:").grid(row=srow, column=0, sticky=tk.NW, pady=2)
         att_mode_frame = ttk.Frame(send_inner)
-        att_mode_frame.grid(row=srow, column=1, columnspan=2, sticky=tk.W, pady=3, padx=(5, 0))
+        att_mode_frame.grid(row=srow, column=1, columnspan=2, sticky=tk.W, pady=2, padx=(5, 0))
         self.var_att_mode = tk.StringVar(value="single")
         ttk.Radiobutton(att_mode_frame, text="单文件", variable=self.var_att_mode,
                         value="single").pack(side=tk.LEFT)
         ttk.Radiobutton(att_mode_frame, text="多文件", variable=self.var_att_mode,
-                        value="multi").pack(side=tk.LEFT, padx=10)
+                        value="multi").pack(side=tk.LEFT, padx=8)
         ttk.Radiobutton(att_mode_frame, text="文件夹", variable=self.var_att_mode,
-                        value="folder").pack(side=tk.LEFT, padx=10)
+                        value="folder").pack(side=tk.LEFT, padx=8)
         srow += 1
 
-        # 附件路径选择
         self.entry_send_attachment = ttk.Entry(send_inner, width=35)
-        self.entry_send_attachment.grid(row=srow, column=1, sticky=tk.EW, pady=3, padx=(5, 0))
+        self.entry_send_attachment.grid(row=srow, column=1, sticky=tk.EW, pady=2, padx=(5, 0))
         att_btn_frame = ttk.Frame(send_inner)
-        att_btn_frame.grid(row=srow, column=2, sticky=tk.W, pady=3, padx=5)
+        att_btn_frame.grid(row=srow, column=2, sticky=tk.W, pady=2, padx=5)
         ttk.Button(att_btn_frame, text="浏览...", command=self._browse_send_att,
                    width=8).pack(side=tk.LEFT)
-        ttk.Button(att_btn_frame, text="清空", command=lambda: self.entry_send_attachment.delete(0, tk.END),
+        ttk.Button(att_btn_frame, text="清空",
+                   command=lambda: self.entry_send_attachment.delete(0, tk.END),
                    width=6).pack(side=tk.LEFT, padx=3)
         srow += 1
 
         ttk.Separator(send_inner, orient=tk.HORIZONTAL).grid(row=srow, column=0, columnspan=3,
-                                                           sticky=tk.EW, pady=10)
+                                                              sticky=tk.EW, pady=8)
         srow += 1
 
-        # 发送定时
-        ttk.Label(send_inner, text="发送日期（可多选）:",
+        # --- 发送定时 ---
+        ttk.Label(send_inner, text="定时设置",
                   font=("", 10, "bold")).grid(row=srow, column=0, columnspan=3, sticky=tk.W)
         srow += 1
-        send_day_frame = ttk.Frame(send_inner)
-        send_day_frame.grid(row=srow, column=0, columnspan=3, sticky=tk.W, pady=5)
+
+        self.var_sd_enabled = tk.BooleanVar(value=False)
+        ttk.Checkbutton(send_inner, text="启用定时发送",
+                        variable=self.var_sd_enabled).grid(
+            row=srow, column=0, columnspan=3, sticky=tk.W, pady=2)
+        srow += 1
+
+        sd_day_frame = ttk.Frame(send_inner)
+        sd_day_frame.grid(row=srow, column=0, columnspan=3, sticky=tk.W, pady=2)
         self.send_day_vars = []
         for i, name in enumerate(self.WEEKDAY_NAMES):
             var = tk.BooleanVar()
             self.send_day_vars.append(var)
-            cb = ttk.Checkbutton(send_day_frame, text=name, variable=var)
-            cb.pack(side=tk.LEFT, padx=5)
+            ttk.Checkbutton(sd_day_frame, text=name, variable=var).pack(side=tk.LEFT, padx=4)
         srow += 1
 
-        send_time_frame = ttk.Frame(send_inner)
-        send_time_frame.grid(row=srow, column=0, columnspan=3, sticky=tk.W, pady=5)
-        ttk.Label(send_time_frame, text="发送时间: 时").pack(side=tk.LEFT)
-        self.spin_send_hour = ttk.Spinbox(send_time_frame, from_=0, to=23, width=5, justify=tk.CENTER)
-        self.spin_send_hour.pack(side=tk.LEFT, padx=(2, 5))
-        self.spin_send_hour.set("8")
-        ttk.Label(send_time_frame, text="分").pack(side=tk.LEFT)
-        self.spin_send_min = ttk.Spinbox(send_time_frame, from_=0, to=59, width=5, justify=tk.CENTER)
-        self.spin_send_min.pack(side=tk.LEFT, padx=(2, 5))
-        self.spin_send_min.set("0")
-        ttk.Label(send_time_frame, text="秒").pack(side=tk.LEFT)
-        self.spin_send_sec = ttk.Spinbox(send_time_frame, from_=0, to=59, width=5, justify=tk.CENTER)
-        self.spin_send_sec.pack(side=tk.LEFT, padx=(2, 5))
-        self.spin_send_sec.set("0")
+        sd_time_frame = ttk.Frame(send_inner)
+        sd_time_frame.grid(row=srow, column=0, columnspan=3, sticky=tk.W, pady=2)
+        ttk.Label(sd_time_frame, text="时").pack(side=tk.LEFT)
+        self.spin_send_hour = ttk.Spinbox(sd_time_frame, from_=0, to=23, width=4,
+                                          justify=tk.CENTER)
+        self.spin_send_hour.pack(side=tk.LEFT, padx=(2, 5)); self.spin_send_hour.set("8")
+        ttk.Label(sd_time_frame, text="分").pack(side=tk.LEFT)
+        self.spin_send_min = ttk.Spinbox(sd_time_frame, from_=0, to=59, width=4,
+                                         justify=tk.CENTER)
+        self.spin_send_min.pack(side=tk.LEFT, padx=(2, 5)); self.spin_send_min.set("0")
+        ttk.Label(sd_time_frame, text="秒").pack(side=tk.LEFT)
+        self.spin_send_sec = ttk.Spinbox(sd_time_frame, from_=0, to=59, width=4,
+                                         justify=tk.CENTER)
+        self.spin_send_sec.pack(side=tk.LEFT, padx=(2, 5)); self.spin_send_sec.set("0")
         srow += 1
 
         ttk.Button(send_inner, text="立即发送一次（测试）", command=self._test_send,
-                   width=22).grid(row=srow, column=0, columnspan=3, pady=10)
+                   width=22).grid(row=srow, column=0, columnspan=3, pady=8)
 
-        send_inner.columnconfigure(1, weight=1)
-
-        # === Tab 4: 运行日志 ===
+        # ================================================================
+        # Tab 3: 运行日志
+        # ================================================================
         tab_log = ttk.Frame(notebook, padding=5)
         notebook.add(tab_log, text="运行日志")
 
@@ -582,8 +575,8 @@ class MailAttachmentTool:
         self.status_label = ttk.Label(bottom_frame, text="状态: 未启动", foreground="gray")
         self.status_label.pack(side=tk.LEFT)
 
-        self.btn_start = ttk.Button(bottom_frame, text="启动定时任务", command=self._toggle_scheduler,
-                                     width=16)
+        self.btn_start = ttk.Button(bottom_frame, text="启动定时任务",
+                                     command=self._toggle_scheduler, width=16)
         self.btn_start.pack(side=tk.RIGHT, padx=5)
 
         ttk.Button(bottom_frame, text="保存配置", command=self._save_ui_config,
@@ -628,6 +621,7 @@ class MailAttachmentTool:
         self.entry_smtp_port.delete(0, tk.END)
         self.entry_smtp_port.insert(0, str(cfg.get("smtp_port", 465)))
         self.var_smtp_ssl.set(cfg.get("smtp_ssl", True))
+        self.var_skip_ssl_smtp.set(cfg.get("skip_ssl_smtp", False))
         self.entry_send_user.delete(0, tk.END)
         self.entry_send_user.insert(0, cfg.get("send_user", ""))
         self.entry_send_pass.delete(0, tk.END)
@@ -689,6 +683,7 @@ class MailAttachmentTool:
                 "smtp_server": self.entry_smtp_server.get().strip(),
                 "smtp_port": int(self.entry_smtp_port.get().strip()),
                 "smtp_ssl": self.var_smtp_ssl.get(),
+                "skip_ssl_smtp": self.var_skip_ssl_smtp.get(),
                 "send_user": self.entry_send_user.get().strip(),
                 "send_pass": self.entry_send_pass.get().strip(),
                 "send_to": self.entry_send_to.get().strip(),
@@ -837,7 +832,7 @@ class MailAttachmentTool:
                 send_user, send_pass,
                 cfg["send_to"], cfg.get("send_subject", ""),
                 cfg.get("send_body", ""), att_paths,
-                cfg.get("skip_ssl_verify", False),
+                cfg.get("skip_ssl_smtp", False),
                 self.log
             )
             self.log("发送成功！")
@@ -996,7 +991,7 @@ class MailAttachmentTool:
                 send_user, send_pass,
                 cfg["send_to"], cfg.get("send_subject", ""),
                 cfg.get("send_body", ""), att_paths,
-                cfg.get("skip_ssl_verify", False),
+                cfg.get("skip_ssl_smtp", False),
                 self.log
             )
             self.log("发送成功！")
