@@ -1,0 +1,155 @@
+=== Multi-test Debug Log ===
+Python: 3.14.0 (tags/v3.14.0:ebf955d, Oct  7 2025, 10:15:03) [MSC v.1944 64 bit (AMD64)]
+
+=== 方案1: 纯文本MIMEText，不用Header ===
+  Raw (265 chars):
+    Content-Type: text/plain; charset="utf-8"
+    MIME-Version: 1.0
+    Content-Transfer-Encoding: base64
+    From: 18736862831@139.com
+    To: 1078058994@qq.com
+    Subject: test subject
+    Date: Mon, 25 May 2026 04:53:09 +0800
+    Message-ID: <1779655989105532700@mail.local>
+    
+    aGVsbG8gdGVzdA==
+    
+  [方案1] FAIL: SMTPDataError: (550, b'2f126a13653019d-021c6 Mail rejected')
+
+=== 方案2: 纯文本，使用Header(utf-8) ===
+  Raw (288 chars):
+    Content-Type: text/plain; charset="utf-8"
+    MIME-Version: 1.0
+    Content-Transfer-Encoding: base64
+    From: 18736862831@139.com
+    To: 1078058994@qq.com
+    Subject: =?utf-8?b?dGVzdCBzdWJqZWN0IOa1i+ivlQ==?=
+    Date: Mon, 25 May 2026 04:53:09 +0800
+    Message-ID: <1779655000.123@mail.local>
+    
+    aGVsbG8gdGVzdA==
+    
+  [方案2] FAIL: SMTPDataError: (550, b'2f116a13652e4fe-0353d Mail rejected')
+
+=== 方案3: MIMEMultipart，不用Header ===
+  Raw (439 chars):
+    Content-Type: multipart/mixed; boundary="===============1791199663375478811=="
+    MIME-Version: 1.0
+    From: 18736862831@139.com
+    To: 1078058994@qq.com
+    Subject: test subject
+    Date: Mon, 25 May 2026 04:53:10 +0800
+    Message-ID: <1779655000.123@mail.local>
+    
+    --===============1791199663375478811==
+    Content-Type: text/plain; charset="utf-8"
+    MIME-Version: 1.0
+    Content-Transfer-Encoding: base64
+    
+    aGVsbG8gdGVzdA==
+    
+  [方案3] FAIL: SMTPDataError: (550, b'2f0f6a13652d765-067df Mail rejected')
+
+=== 方案4: 不加Message-ID ===
+  Raw (220 chars):
+    Content-Type: text/plain; charset="utf-8"
+    MIME-Version: 1.0
+    Content-Transfer-Encoding: base64
+    From: 18736862831@139.com
+    To: 1078058994@qq.com
+    Subject: test subject
+    Date: Mon, 25 May 2026 04:53:10 +0800
+    
+    aGVsbG8gdGVzdA==
+    
+  [方案4] FAIL: SMTPDataError: (552, b'2f026a136535162-0218a Sender one minutes sent mail exceed limit')
+
+=== 方案5: 不加Date ===
+  连接/其它错误: _ssl.c:1059: The handshake operation timed out
+
+=== 方案6: 含中文主题 ===
+  Raw (268 chars):
+    Content-Type: text/plain; charset="utf-8"
+    MIME-Version: 1.0
+    Content-Transfer-Encoding: base64
+    From: 18736862831@139.com
+    To: 1078058994@qq.com
+    Subject: =?utf-8?b?5rWL6K+V6YKu5Lu2?=
+    Date: Mon, 25 May 2026 04:53:41 +0800
+    Message-ID: <1779655000.123@mail.local>
+    
+    aGVsbG8=
+    
+  [方案6] FAIL: SMTPDataError: (550, b'2ee46a13654eb76-03bc2 Mail rejected')
+
+=== 所有方案均失败 ===
+=== 等待60秒后测试 ===
+等待60秒（139.com速率限制）...
+开始测试!
+
+=== 测试A: 手动纯ASCII 7bit邮件 ===
+  Using send_message (SMTPSenderRefused test)
+  FAIL: SMTPDataError: (550, b'2eef6a1365cfa8b-03ad2 Mail rejected')
+
+=== 测试B: MIMEText 强制8bit ===
+  Email (244 chars):
+    Content-Type: text/plain; charset="utf-8"
+    MIME-Version: 1.0
+    From: 18736862831@139.com
+    To: 1078058994@qq.com
+    Subject: test
+    Date: Mon, 25 May 2026 04:55:45 +0800
+    Message-ID: <test8bit@mail.local>
+    Content-Transfer-Encoding: 8bit
+    
+    aGVsbG8gdGVzdA==
+    
+  FAIL: SMTPDataError: (550, b'2ee46a1365d0bd3-03c20 Mail rejected')
+
+=== 所有测试完成 ===
+=== 终极测试 ===
+Python: 3.14.0 (tags/v3.14.0:ebf955d, Oct  7 2025, 10:15:03) [MSC v.1944 64 bit (AMD64)]
+
+=== 测试1: SSL465 + send_message ===
+  Raw (199 chars):
+    From: 18736862831@139.com
+    To: 1078058994@qq.com
+    Subject: test
+    Date: Mon, 25 May 2026 04:56:48 +0800
+    Content-Type: text/plain; charset="utf-8"
+    Content-Transfer-Encoding: 7bit
+    MIME-Version: 1.0
+    
+    hello
+    
+  FAIL: SMTPDataError: (550, b'2f376a13660d8c4-018e6 Mail rejected')
+
+=== 测试2: SMTP 25 + STARTTLS ===
+  FAIL: TimeoutError: [WinError 10060] 由于连接方在一段时间后没有正确答复或连接的主机没有反应，连接尝试失败。
+
+=== 测试3: 裸SMTP命令（手工DATA） ===
+  FAIL: TimeoutError: _ssl.c:1059: The handshake operation timed out
+
+=== 测试4: 检查服务器能力 ===
+  EHLO: 250
+    mail
+    X-PART
+    PIPELINING
+    AUTH LOGIN PLAIN
+    AUTH=LOGIN PLAIN
+    8BITMIME
+  MAIL FROM SMTPUTF8: 250 b'ok'
+  MAIL FROM 8BITMIME: 503 b'repeatd mail from commands'
+
+=== 所有测试完成 ===
+=== 自己发自己测试 ===
+测试: 18736862831@139.com -> 18736862831@139.com (自己)
+  SSL OK
+  Login OK
+  Email size: 309 chars
+  FAIL: SMTPDataError: (450, b'2f2c6a1366e9b3b-03b82 Mail rejected, please try again')
+
+测试: 18736862831@139.com -> 1078058994@qq.com (外部)
+  FAIL: SMTPDataError: (550, b'2f166a1366ec197-021c0 Mail rejected')
+
+=== 测试完成 ===

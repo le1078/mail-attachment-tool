@@ -36,6 +36,7 @@ DEFAULT_CONFIG = {
     "email_user": "",
     "email_pass": "",
     "sender_filter_list": [],    # 发件人筛选列表，一行一个
+    "download_keyword_filter": "",  # 邮件主题关键词筛选
     "save_folder": "",
     "skip_ssl_verify": False,
     "schedule_download": {
@@ -145,12 +146,14 @@ def connect_imap(server, port, user, password, skip_ssl_verify=False):
 
 
 def fetch_attachments(mail, sender_filter_list, save_folder, log_func,
+                      keyword_filter="",
                       filter_days=None, filter_time_enabled=False,
                       filter_time_start="00:00", filter_time_end="23:59",
                       filter_date_enabled=False, filter_date_start="", filter_date_end=""):
     """
-    从收件箱中查找指定发件人的邮件，下载附件
-    sender_filter_list: 发件人筛选列表（每个元素是一个关键词）
+    从收件箱中查找符合条件的邮件，下载附件
+    sender_filter_list: 发件人筛选列表（每个元素是一个关键词），空=不限发件人
+    keyword_filter: 主题关键词筛选，空=不限关键词
     filter_days: 仅下载这些星期几（1=周一..7=周日）的邮件，None/空=不限
     filter_time_start, filter_time_end: 仅下载此时间段内的邮件（HH:MM），filter_time_enabled=False=不限
     filter_date_start, filter_date_end: 仅下载此日期范围内的邮件（YYYY-MM-DD），filter_date_enabled=False=不限
@@ -167,7 +170,7 @@ def fetch_attachments(mail, sender_filter_list, save_folder, log_func,
         log_func("收件箱为空")
         return 0
 
-    log_func(f"收件箱共 {len(mail_ids)} 封邮件，筛选条件: {sender_filter_list}，开始扫描...")
+    log_func(f"收件箱共 {len(mail_ids)} 封邮件，筛选条件: 发件人={sender_filter_list}, 关键词={keyword_filter or '无'}，开始扫描...")
     download_count = 0
 
     # 只检查最近的邮件（避免每次都扫描全部）
@@ -196,10 +199,17 @@ def fetch_attachments(mail, sender_filter_list, save_folder, log_func,
                 from_ = decode_str(msg.get("From", ""))
                 subject = decode_str(msg.get("Subject", ""))
 
-                # 检查发件人是否匹配任一筛选条件
+                # 检查发件人和关键词筛选
                 from_lower = from_.lower()
-                matched = any(f.strip().lower() in from_lower for f in sender_filter_list if f.strip())
-                if not matched:
+                sender_matched = True  # 默认通过（未设发件人筛选时）
+                if sender_filter_list and any(f.strip() for f in sender_filter_list):
+                    sender_matched = any(f.strip().lower() in from_lower for f in sender_filter_list if f.strip())
+                kw = (keyword_filter or "").strip().lower()
+                kw_matched = True  # 默认通过（未设关键词时）
+                if kw:
+                    subj_lower = subject.lower()
+                    kw_matched = kw in subj_lower
+                if not (sender_matched and kw_matched):
                     continue
 
                 # 邮件日期/时间过滤
@@ -433,6 +443,13 @@ class MailAttachmentTool:
         self.entry_sender = ttk.Entry(dl_inner, width=35)
         self.entry_sender.grid(row=row, column=1, sticky=tk.W, pady=2, padx=(5, 0))
         ttk.Label(dl_inner, text="(英文逗号分隔，支持邮箱或姓名模糊匹配)", foreground="gray").grid(
+            row=row, column=2, sticky=tk.W, pady=2, padx=5)
+        row += 1
+
+        ttk.Label(dl_inner, text="主题关键词:").grid(row=row, column=0, sticky=tk.W, pady=2)
+        self.entry_keyword = ttk.Entry(dl_inner, width=35)
+        self.entry_keyword.grid(row=row, column=1, sticky=tk.W, pady=2, padx=(5, 0))
+        ttk.Label(dl_inner, text="(筛选主题含此关键词的邮件，与发件人可共用)", foreground="gray").grid(
             row=row, column=2, sticky=tk.W, pady=2, padx=5)
         row += 1
 
@@ -792,6 +809,8 @@ class MailAttachmentTool:
             filter_list = [cfg["sender_filter"]]
         self.entry_sender.delete(0, tk.END)
         self.entry_sender.insert(0, ", ".join(filter_list))
+        self.entry_keyword.delete(0, tk.END)
+        self.entry_keyword.insert(0, cfg.get("download_keyword_filter", ""))
         self.entry_folder.delete(0, tk.END)
         self.entry_folder.insert(0, cfg.get("save_folder", ""))
 
@@ -891,6 +910,7 @@ class MailAttachmentTool:
                 "sender_filter_list": [
                     s.strip() for s in self.entry_sender.get().split(",") if s.strip()
                 ],
+                "download_keyword_filter": self.entry_keyword.get().strip(),
                 "save_folder": self.entry_folder.get().strip(),
                 "skip_ssl_verify": self.var_skip_ssl.get(),
                 "schedule_download": {
@@ -954,6 +974,7 @@ class MailAttachmentTool:
             "sender_filter_list": [
                 s.strip() for s in self.entry_sender.get().split(",") if s.strip()
             ],
+            "download_keyword_filter": self.entry_keyword.get().strip(),
             "save_folder": self.entry_folder.get().strip(),
             "skip_ssl_verify": self.var_skip_ssl.get(),
             "schedule_download": {
@@ -981,6 +1002,7 @@ class MailAttachmentTool:
         self.entry_user.delete(0, tk.END)
         self.entry_pass.delete(0, tk.END)
         self.entry_sender.delete(0, tk.END)
+        self.entry_keyword.delete(0, tk.END)
         self.entry_folder.delete(0, tk.END)
         self.var_skip_ssl.set(False)
         self.var_dl_enabled.set(False)
@@ -1099,6 +1121,11 @@ class MailAttachmentTool:
             return []
         return []
 
+    def _format_subject(self, subject):
+        """替换主题中的日期占位符 YYYY → 年, MM → 月(去0), DD → 日(去0)"""
+        now = datetime.datetime.now()
+        return subject.replace("YYYY", str(now.year)).replace("MM", str(now.month)).replace("DD", str(now.day))
+
     # ---------- 核心操作 ----------
     def _test_and_run(self):
         """测试连接并立即执行一次下载"""
@@ -1109,8 +1136,9 @@ class MailAttachmentTool:
             messagebox.showerror("错误", "请先填写邮箱账号和密码/授权码")
             return
         filter_list = cfg.get("sender_filter_list", [])
-        if not filter_list:
-            messagebox.showerror("错误", "请填写至少一个发件人筛选条件")
+        keyword_filter = cfg.get("download_keyword_filter", "").strip()
+        if not filter_list and not keyword_filter:
+            messagebox.showerror("错误", "请填写发件人筛选或主题关键词（至少填一个）")
             return
         if not cfg["save_folder"]:
             messagebox.showerror("错误", "请选择附件保存目录")
@@ -1135,6 +1163,7 @@ class MailAttachmentTool:
             count = fetch_attachments(mail, filter_list,
                                       cfg["save_folder"],
                                       lambda msg: self.log(msg, "download"),
+                                      keyword_filter=keyword_filter,
                                       filter_days=filter_days if filter_days else None,
                                       filter_time_enabled=filter_time_enabled,
                                       filter_time_start=cfg.get("download_filter_time_start", "00:00"),
@@ -1179,10 +1208,11 @@ class MailAttachmentTool:
         try:
             self.log(f"正在连接 {cfg['smtp_server']}:{cfg['smtp_port']} ...", "send")
             att_paths = self._resolve_attachment_paths(cfg)
+            formatted_subject = self._format_subject(cfg.get("send_subject", ""))
             send_email(
                 cfg["smtp_server"], cfg["smtp_port"], cfg["smtp_ssl"],
                 send_user, send_pass,
-                cfg["send_to"], cfg.get("send_subject", ""),
+                cfg["send_to"], formatted_subject,
                 cfg.get("send_body", ""), att_paths,
                 cfg.get("skip_ssl_smtp", False),
                 lambda msg: self.log(msg, "send")
@@ -1221,8 +1251,9 @@ class MailAttachmentTool:
                 messagebox.showerror("错误", "下载任务已启用，请填写邮箱账号和密码")
                 return
             filter_list = cfg.get("sender_filter_list", [])
-            if not filter_list:
-                messagebox.showerror("错误", "下载任务已启用，请填写至少一个发件人筛选条件")
+            keyword_filter = cfg.get("download_keyword_filter", "").strip()
+            if not filter_list and not keyword_filter:
+                messagebox.showerror("错误", "下载任务已启用，请填写发件人筛选或主题关键词（至少填一个）")
                 return
             if not cfg.get("save_folder"):
                 messagebox.showerror("错误", "下载任务已启用，请选择附件保存目录")
@@ -1335,11 +1366,13 @@ class MailAttachmentTool:
             filter_days = cfg.get("download_filter_days", [])
             filter_time_enabled = cfg.get("download_filter_time_enabled", False)
             filter_date_enabled = cfg.get("download_filter_date_enabled", False)
+            keyword_filter = cfg.get("download_keyword_filter", "").strip()
             if filter_days or filter_time_enabled or filter_date_enabled:
                 self.log(f"邮件筛选: 接收日={filter_days}, 时间段={'启用' if filter_time_enabled else '不启用'}, 日期范围={'启用' if filter_date_enabled else '不启用'}", "download")
             count = fetch_attachments(mail, filter_list,
                                       cfg["save_folder"],
                                       lambda msg: self.log(msg, "download"),
+                                      keyword_filter=keyword_filter,
                                       filter_days=filter_days if filter_days else None,
                                       filter_time_enabled=filter_time_enabled,
                                       filter_time_start=cfg.get("download_filter_time_start", "00:00"),
@@ -1368,10 +1401,11 @@ class MailAttachmentTool:
         try:
             self.log(f"正在连接 {cfg['smtp_server']}:{cfg['smtp_port']} ...", "send")
             att_paths = self._resolve_attachment_paths(cfg)
+            formatted_subject = self._format_subject(cfg.get("send_subject", ""))
             send_email(
                 cfg["smtp_server"], cfg["smtp_port"], cfg["smtp_ssl"],
                 send_user, send_pass,
-                cfg["send_to"], cfg.get("send_subject", ""),
+                cfg["send_to"], formatted_subject,
                 cfg.get("send_body", ""), att_paths,
                 cfg.get("skip_ssl_smtp", False),
                 lambda msg: self.log(msg, "send")
