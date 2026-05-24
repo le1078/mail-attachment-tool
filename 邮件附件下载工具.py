@@ -120,6 +120,46 @@ def clean_filename(name):
     return re.sub(r'[\\/:*?"<>|]', "_", name)
 
 
+def decode_attachment_filename(part):
+    """
+    稳健解码附件文件名，处理各种中文编码：
+    - RFC 2047: =?charset?B?...?=
+    - RFC 2231: charset'language'encoded
+    - 原始 GBK/GB2312/GB18030 字节
+    """
+    filename = decode_attachment_filename(part)
+    if not filename:
+        return None
+
+    # 先尝试 decode_header（处理 RFC 2047）
+    decoded = decode_str(filename)
+
+    # 如果结果含乱码替换字符，说明是原始字节被错误解码了
+    if '\ufffd' in decoded or '\\x' in repr(decoded):
+        # 尝试从原始字节恢复
+        raw_bytes = None
+        if isinstance(filename, str):
+            try:
+                raw_bytes = filename.encode('latin-1')
+            except UnicodeEncodeError:
+                raw_bytes = filename.encode('utf-8', errors='surrogateescape')
+        else:
+            raw_bytes = filename
+
+        if raw_bytes:
+            # 依次尝试常见中文编码
+            for enc in ['gb18030', 'gbk', 'gb2312', 'utf-8', 'big5']:
+                try:
+                    trial = raw_bytes.decode(enc)
+                    if '\ufffd' not in trial:
+                        decoded = trial
+                        break
+                except (UnicodeDecodeError, UnicodeError, LookupError):
+                    continue
+
+    return decoded
+
+
 # ==================== SSL兼容处理 ====================
 def _create_ssl_context(skip_verify=False):
     """创建兼容的SSL上下文，解决Python 3.12+ SSL handshake failure"""
@@ -250,9 +290,9 @@ def fetch_attachments(mail, sender_filter_list, save_folder, log_func,
                     for part in msg.walk():
                         content_disposition = str(part.get("Content-Disposition", ""))
                         if "attachment" in content_disposition:
-                            filename = part.get_filename()
+                            filename = decode_attachment_filename(part)
                             if filename:
-                                filename = clean_filename(decode_str(filename))
+                                filename = clean_filename(filename)
                                 filepath = os.path.join(save_folder, filename)
                                 # 处理重名：追加下载时间戳
                                 if os.path.exists(filepath):
@@ -268,9 +308,9 @@ def fetch_attachments(mail, sender_filter_list, save_folder, log_func,
                     content_type = msg.get_content_type()
                     content_disposition = str(msg.get("Content-Disposition", ""))
                     if "attachment" in content_disposition:
-                        filename = msg.get_filename()
+                        filename = decode_attachment_filename(msg)
                         if filename:
-                            filename = clean_filename(decode_str(filename))
+                            filename = clean_filename(filename)
                             filepath = os.path.join(save_folder, filename)
                             if os.path.exists(filepath):
                                 base, ext = os.path.splitext(filename)
