@@ -50,6 +50,10 @@ DEFAULT_CONFIG = {
     "download_filter_time_enabled": False, # 启用时间段过滤
     "download_filter_time_start": "00:00", # 起始时间
     "download_filter_time_end": "23:59",   # 截止时间
+    # === 邮件下载日期范围过滤（可选） ===
+    "download_filter_date_enabled": False,  # 启用日期范围过滤
+    "download_filter_date_start": "",       # 起始日期 YYYY-MM-DD
+    "download_filter_date_end": "",         # 截止日期 YYYY-MM-DD
     # === 发送配置 ===
     "smtp_server": "",
     "smtp_port": 465,
@@ -142,12 +146,14 @@ def connect_imap(server, port, user, password, skip_ssl_verify=False):
 
 def fetch_attachments(mail, sender_filter_list, save_folder, log_func,
                       filter_days=None, filter_time_enabled=False,
-                      filter_time_start="00:00", filter_time_end="23:59"):
+                      filter_time_start="00:00", filter_time_end="23:59",
+                      filter_date_enabled=False, filter_date_start="", filter_date_end=""):
     """
     从收件箱中查找指定发件人的邮件，下载附件
     sender_filter_list: 发件人筛选列表（每个元素是一个关键词）
     filter_days: 仅下载这些星期几（1=周一..7=周日）的邮件，None/空=不限
     filter_time_start, filter_time_end: 仅下载此时间段内的邮件（HH:MM），filter_time_enabled=False=不限
+    filter_date_start, filter_date_end: 仅下载此日期范围内的邮件（YYYY-MM-DD），filter_date_enabled=False=不限
     """
     mail.select("INBOX")
     # 搜索所有邮件
@@ -194,17 +200,15 @@ def fetch_attachments(mail, sender_filter_list, save_folder, log_func,
                 from_lower = from_.lower()
                 matched = any(f.strip().lower() in from_lower for f in sender_filter_list if f.strip())
                 if not matched:
-                    new_processed.add(mail_id_str)
                     continue
 
                 # 邮件日期/时间过滤
                 date_str = msg.get("Date", "")
-                if date_str and ((filter_days and len(filter_days) < 7) or filter_time_enabled):
+                if date_str and ((filter_days and len(filter_days) < 7) or filter_time_enabled or filter_date_enabled):
                     try:
                         dt = parsedate_to_datetime(date_str)
                         # 星期过滤
                         if filter_days and dt.isoweekday() not in filter_days:
-                            new_processed.add(mail_id_str)
                             continue
                         # 时间段过滤
                         if filter_time_enabled:
@@ -214,13 +218,18 @@ def fetch_attachments(mail, sender_filter_list, save_folder, log_func,
                             now_t = h * 60 + m
                             if t_start <= t_end:
                                 if not (t_start <= now_t <= t_end):
-                                    new_processed.add(mail_id_str)
                                     continue
                             else:
                                 # 跨日（如22:00~06:00）
                                 if not (now_t >= t_start or now_t <= t_end):
-                                    new_processed.add(mail_id_str)
                                     continue
+                        # 日期范围过滤（年月日-年月日）
+                        if filter_date_enabled and filter_date_start and filter_date_end:
+                            dt_date = dt.date()
+                            d_start = datetime.datetime.strptime(filter_date_start, "%Y-%m-%d").date()
+                            d_end = datetime.datetime.strptime(filter_date_end, "%Y-%m-%d").date()
+                            if not (d_start <= dt_date <= d_end):
+                                continue
                     except Exception:
                         pass  # 解析日期失败则跳过过滤
 
@@ -515,6 +524,21 @@ class MailAttachmentTool:
         self.spin_dl_email_m2.pack(side=tk.LEFT); self.spin_dl_email_m2.set("59")
         row += 1
 
+        # 邮件接收日期范围
+        ttk.Label(dl_inner, text="接收日期范围:").grid(row=row, column=0, sticky=tk.W, pady=2)
+        dl_email_date_frame = ttk.Frame(dl_inner)
+        dl_email_date_frame.grid(row=row, column=1, columnspan=2, sticky=tk.W, pady=2)
+        self.var_dl_email_date = tk.BooleanVar()
+        ttk.Checkbutton(dl_email_date_frame, text="启用",
+                        variable=self.var_dl_email_date).pack(side=tk.LEFT, padx=(0, 5))
+        self.entry_dl_email_date1 = ttk.Entry(dl_email_date_frame, width=11)
+        self.entry_dl_email_date1.pack(side=tk.LEFT)
+        ttk.Label(dl_email_date_frame, text=" ~ ").pack(side=tk.LEFT)
+        self.entry_dl_email_date2 = ttk.Entry(dl_email_date_frame, width=11)
+        self.entry_dl_email_date2.pack(side=tk.LEFT)
+        ttk.Label(dl_email_date_frame, text=" (YYYY-MM-DD)", foreground="gray").pack(side=tk.LEFT)
+        row += 1
+
         dl_btn_frame = ttk.Frame(dl_inner)
         dl_btn_frame.grid(row=row, column=0, columnspan=3, pady=8)
         ttk.Button(dl_btn_frame, text="立即执行一次", command=self._test_and_run,
@@ -794,6 +818,11 @@ class MailAttachmentTool:
         self.spin_dl_email_m1.set(t_start.split(":")[1])
         self.spin_dl_email_h2.set(t_end.split(":")[0])
         self.spin_dl_email_m2.set(t_end.split(":")[1])
+        self.var_dl_email_date.set(cfg.get("download_filter_date_enabled", False))
+        self.entry_dl_email_date1.delete(0, tk.END)
+        self.entry_dl_email_date1.insert(0, cfg.get("download_filter_date_start", ""))
+        self.entry_dl_email_date2.delete(0, tk.END)
+        self.entry_dl_email_date2.insert(0, cfg.get("download_filter_date_end", ""))
 
         # 发送配置
         self.entry_smtp_server.delete(0, tk.END)
@@ -875,6 +904,9 @@ class MailAttachmentTool:
                 "download_filter_time_enabled": self.var_dl_email_time.get(),
                 "download_filter_time_start": f"{int(self.spin_dl_email_h1.get()):02d}:{int(self.spin_dl_email_m1.get()):02d}",
                 "download_filter_time_end": f"{int(self.spin_dl_email_h2.get()):02d}:{int(self.spin_dl_email_m2.get()):02d}",
+                "download_filter_date_enabled": self.var_dl_email_date.get(),
+                "download_filter_date_start": self.entry_dl_email_date1.get().strip(),
+                "download_filter_date_end": self.entry_dl_email_date2.get().strip(),
                 # 发送配置
                 "smtp_server": self.entry_smtp_server.get().strip(),
                 "smtp_port": int(self.entry_smtp_port.get().strip()),
@@ -935,6 +967,9 @@ class MailAttachmentTool:
             "download_filter_time_enabled": self.var_dl_email_time.get(),
             "download_filter_time_start": f"{int(self.spin_dl_email_h1.get()):02d}:{int(self.spin_dl_email_m1.get()):02d}",
             "download_filter_time_end": f"{int(self.spin_dl_email_h2.get()):02d}:{int(self.spin_dl_email_m2.get()):02d}",
+            "download_filter_date_enabled": self.var_dl_email_date.get(),
+            "download_filter_date_start": self.entry_dl_email_date1.get().strip(),
+            "download_filter_date_end": self.entry_dl_email_date2.get().strip(),
         })
         save_config(self.config)
         self.log("下载配置已保存")
@@ -958,6 +993,9 @@ class MailAttachmentTool:
         self.var_dl_email_time.set(False)
         self.spin_dl_email_h1.set("0"); self.spin_dl_email_m1.set("0")
         self.spin_dl_email_h2.set("23"); self.spin_dl_email_m2.set("59")
+        self.var_dl_email_date.set(False)
+        self.entry_dl_email_date1.delete(0, tk.END)
+        self.entry_dl_email_date2.delete(0, tk.END)
         self._save_download_config()
         self.log("下载配置已清除")
 
@@ -1089,10 +1127,21 @@ class MailAttachmentTool:
                                 cfg["email_user"], cfg["email_pass"],
                                 cfg.get("skip_ssl_verify", False))
             self.log("连接成功！", "download")
-
+            filter_days = cfg.get("download_filter_days", [])
+            filter_time_enabled = cfg.get("download_filter_time_enabled", False)
+            filter_date_enabled = cfg.get("download_filter_date_enabled", False)
+            if filter_days or filter_time_enabled or filter_date_enabled:
+                self.log(f"邮件筛选: 接收日={filter_days}, 时间段={'启用' if filter_time_enabled else '不启用'}, 日期范围={'启用' if filter_date_enabled else '不启用'}", "download")
             count = fetch_attachments(mail, filter_list,
                                       cfg["save_folder"],
-                                      lambda msg: self.log(msg, "download"))
+                                      lambda msg: self.log(msg, "download"),
+                                      filter_days=filter_days if filter_days else None,
+                                      filter_time_enabled=filter_time_enabled,
+                                      filter_time_start=cfg.get("download_filter_time_start", "00:00"),
+                                      filter_time_end=cfg.get("download_filter_time_end", "23:59"),
+                                      filter_date_enabled=filter_date_enabled,
+                                      filter_date_start=cfg.get("download_filter_date_start", ""),
+                                      filter_date_end=cfg.get("download_filter_date_end", ""))
             mail.logout()
             self.log(f"本次下载了 {count} 个附件", "download")
             if count == 0:
@@ -1285,15 +1334,19 @@ class MailAttachmentTool:
             filter_list = cfg.get("sender_filter_list", [])
             filter_days = cfg.get("download_filter_days", [])
             filter_time_enabled = cfg.get("download_filter_time_enabled", False)
-            if filter_days or filter_time_enabled:
-                self.log(f"邮件筛选: 接收日={filter_days}, 时间段={'启用' if filter_time_enabled else '不启用'}", "download")
+            filter_date_enabled = cfg.get("download_filter_date_enabled", False)
+            if filter_days or filter_time_enabled or filter_date_enabled:
+                self.log(f"邮件筛选: 接收日={filter_days}, 时间段={'启用' if filter_time_enabled else '不启用'}, 日期范围={'启用' if filter_date_enabled else '不启用'}", "download")
             count = fetch_attachments(mail, filter_list,
                                       cfg["save_folder"],
                                       lambda msg: self.log(msg, "download"),
                                       filter_days=filter_days if filter_days else None,
                                       filter_time_enabled=filter_time_enabled,
                                       filter_time_start=cfg.get("download_filter_time_start", "00:00"),
-                                      filter_time_end=cfg.get("download_filter_time_end", "23:59"))
+                                      filter_time_end=cfg.get("download_filter_time_end", "23:59"),
+                                      filter_date_enabled=filter_date_enabled,
+                                      filter_date_start=cfg.get("download_filter_date_start", ""),
+                                      filter_date_end=cfg.get("download_filter_date_end", ""))
             mail.logout()
             self.log(f"本次下载了 {count} 个附件", "download")
             if count == 0:
