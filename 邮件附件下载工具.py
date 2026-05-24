@@ -31,7 +31,7 @@ from PIL import Image, ImageDraw
 CONFIG_FILE = Path(__file__).parent / "config.json"
 DEFAULT_CONFIG = {
     # === 下载配置 ===
-    "imap_server": "imap.qq.com",
+    "imap_server": "",
     "imap_port": 993,
     "email_user": "",
     "email_pass": "",
@@ -39,16 +39,19 @@ DEFAULT_CONFIG = {
     "save_folder": "",
     "skip_ssl_verify": False,
     "schedule_download": {
-        "days": [1, 2, 3, 4, 5],
+        "days": [],
         "hour": 9,
         "minute": 0,
         "second": 0,
-        "enabled": True
+        "enabled": False
     },
     # === 发送配置 ===
-    "smtp_server": "smtp.qq.com",
+    "smtp_server": "",
     "smtp_port": 465,
     "smtp_ssl": True,
+    "skip_ssl_smtp": False,
+    "send_user": "",
+    "send_pass": "",
     "send_to": "",
     "send_subject": "",
     "send_body": "",
@@ -56,12 +59,19 @@ DEFAULT_CONFIG = {
     "send_attachment_list": [],         # 多文件或文件夹模式下的路径列表
     "send_attachment": "",             # 单文件模式（兼容旧配置）
     "schedule_send": {
-        "days": [1, 2, 3, 4, 5],
+        "days": [],
         "hour": 8,
         "minute": 0,
         "second": 0,
         "enabled": False
-    }
+    },
+    # === 日志导出 ===
+    "log_export_enabled": False,
+    "log_export_folder": "",
+    "log_export_days": [],
+    "log_export_hour": 23,
+    "log_export_minute": 59,
+    "log_export_second": 0,
 }
 
 
@@ -295,8 +305,8 @@ class MailAttachmentTool:
 
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("邮件附件下载 & 定时发送工具 v3.0")
-        self.root.geometry("700x620")
+        self.root.title("邮件附件下载 & 定时发送工具 v3.1")
+        self.root.geometry("720x680")
         self.root.resizable(True, True)
 
         self.config = load_config()
@@ -304,6 +314,8 @@ class MailAttachmentTool:
         self.stop_event = threading.Event()
         self.scheduler_thread = None
         self.tray_icon = None  # 托盘图标
+        self.log_entries = []  # 结构化日志: [{"time":..., "cat":..., "msg":...}]
+        self.log_filter = "all"  # all / download / send
 
         self._build_ui()
         self._load_config_to_ui()
@@ -571,13 +583,64 @@ class MailAttachmentTool:
         tab_log = ttk.Frame(notebook, padding=5)
         notebook.add(tab_log, text="运行日志")
 
+        # 筛选 + 导出按钮栏
+        log_toolbar = ttk.Frame(tab_log)
+        log_toolbar.pack(fill=tk.X, pady=(0, 3))
+        ttk.Label(log_toolbar, text="筛选:").pack(side=tk.LEFT)
+        ttk.Button(log_toolbar, text="全部", width=6,
+                   command=lambda: self._apply_log_filter("all")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(log_toolbar, text="下载", width=6,
+                   command=lambda: self._apply_log_filter("download")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(log_toolbar, text="发送", width=6,
+                   command=lambda: self._apply_log_filter("send")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(log_toolbar, text="系统", width=6,
+                   command=lambda: self._apply_log_filter("system")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(log_toolbar, text="导出日志", width=10,
+                   command=self._export_log).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(log_toolbar, text="清空日志", width=10,
+                   command=self._clear_log).pack(side=tk.RIGHT, padx=2)
+
+        # 日志文本框
         self.log_text = scrolledtext.ScrolledText(tab_log, wrap=tk.WORD,
                                                    font=("Consolas", 9),
                                                    state=tk.DISABLED)
         self.log_text.pack(fill=tk.BOTH, expand=True)
 
-        clear_btn = ttk.Button(tab_log, text="清空日志", command=self._clear_log)
-        clear_btn.pack(pady=5)
+        # 定时导出设置
+        export_frame = ttk.LabelFrame(tab_log, text="定时导出日志", padding=5)
+        export_frame.pack(fill=tk.X, pady=(5, 0))
+
+        er1 = ttk.Frame(export_frame)
+        er1.pack(fill=tk.X, pady=2)
+        self.var_export_enabled = tk.BooleanVar(value=False)
+        ttk.Checkbutton(er1, text="启用定时导出",
+                        variable=self.var_export_enabled).pack(side=tk.LEFT)
+        ttk.Label(er1, text="导出目录:").pack(side=tk.LEFT, padx=(15, 0))
+        self.entry_export_folder = ttk.Entry(er1, width=28)
+        self.entry_export_folder.pack(side=tk.LEFT, padx=3)
+        ttk.Button(er1, text="浏览...", command=self._browse_export_folder,
+                   width=7).pack(side=tk.LEFT)
+
+        er2 = ttk.Frame(export_frame)
+        er2.pack(fill=tk.X, pady=2)
+        ttk.Label(er2, text="日期:").pack(side=tk.LEFT)
+        self.export_day_vars = []
+        for i, name in enumerate(self.WEEKDAY_NAMES):
+            var = tk.BooleanVar()
+            self.export_day_vars.append(var)
+            ttk.Checkbutton(er2, text=name, variable=var).pack(side=tk.LEFT, padx=2)
+        ttk.Label(er2, text="  时间: 时").pack(side=tk.LEFT, padx=(10, 0))
+        self.spin_export_hour = ttk.Spinbox(er2, from_=0, to=23, width=4, justify=tk.CENTER)
+        self.spin_export_hour.pack(side=tk.LEFT, padx=(2, 3))
+        self.spin_export_hour.set("23")
+        ttk.Label(er2, text="分").pack(side=tk.LEFT)
+        self.spin_export_min = ttk.Spinbox(er2, from_=0, to=59, width=4, justify=tk.CENTER)
+        self.spin_export_min.pack(side=tk.LEFT, padx=(2, 3))
+        self.spin_export_min.set("59")
+        ttk.Label(er2, text="秒").pack(side=tk.LEFT)
+        self.spin_export_sec = ttk.Spinbox(er2, from_=0, to=59, width=4, justify=tk.CENTER)
+        self.spin_export_sec.pack(side=tk.LEFT, padx=(2, 3))
+        self.spin_export_sec.set("0")
 
         # --- 底部控制栏 ---
         bottom_frame = ttk.Frame(main_frame)
@@ -618,8 +681,8 @@ class MailAttachmentTool:
 
         # 下载定时
         dl = cfg.get("schedule_download", DEFAULT_CONFIG["schedule_download"])
-        self.var_dl_enabled.set(dl.get("enabled", True))
-        days = dl.get("days", [1, 2, 3, 4, 5])
+        self.var_dl_enabled.set(dl.get("enabled", False))
+        days = dl.get("days", [])
         for i in range(7):
             self.day_vars[i].set((i + 1) in days)
         self.spin_hour.set(str(dl.get("hour", 9)))
@@ -659,17 +722,29 @@ class MailAttachmentTool:
         # 发送定时
         sd = cfg.get("schedule_send", DEFAULT_CONFIG["schedule_send"])
         self.var_sd_enabled.set(sd.get("enabled", False))
-        send_days = sd.get("days", [1, 2, 3, 4, 5])
+        send_days = sd.get("days", [])
         for i in range(7):
             self.send_day_vars[i].set((i + 1) in send_days)
         self.spin_send_hour.set(str(sd.get("hour", 8)))
         self.spin_send_min.set(str(sd.get("minute", 0)))
         self.spin_send_sec.set(str(sd.get("second", 0)))
 
+        # 日志导出定时
+        self.var_export_enabled.set(cfg.get("log_export_enabled", False))
+        self.entry_export_folder.delete(0, tk.END)
+        self.entry_export_folder.insert(0, cfg.get("log_export_folder", ""))
+        exp_days = cfg.get("log_export_days", [])
+        for i in range(7):
+            self.export_day_vars[i].set((i + 1) in exp_days)
+        self.spin_export_hour.set(str(cfg.get("log_export_hour", 23)))
+        self.spin_export_min.set(str(cfg.get("log_export_minute", 59)))
+        self.spin_export_sec.set(str(cfg.get("log_export_second", 0)))
+
     def _save_ui_config(self):
         try:
             dl_days = [i + 1 for i, var in enumerate(self.day_vars) if var.get()]
             sd_days = [i + 1 for i, var in enumerate(self.send_day_vars) if var.get()]
+            exp_days = [i + 1 for i, var in enumerate(self.export_day_vars) if var.get()]
 
             cfg = {
                 # 下载配置
@@ -709,7 +784,14 @@ class MailAttachmentTool:
                     "minute": int(self.spin_send_min.get()),
                     "second": int(self.spin_send_sec.get()),
                     "enabled": self.var_sd_enabled.get()
-                }
+                },
+                # 日志导出
+                "log_export_enabled": self.var_export_enabled.get(),
+                "log_export_folder": self.entry_export_folder.get().strip(),
+                "log_export_days": exp_days,
+                "log_export_hour": int(self.spin_export_hour.get()),
+                "log_export_minute": int(self.spin_export_min.get()),
+                "log_export_second": int(self.spin_export_sec.get()),
             }
             save_config(cfg)
             self.config = cfg
@@ -789,32 +871,33 @@ class MailAttachmentTool:
 
         os.makedirs(cfg["save_folder"], exist_ok=True)
 
-        self.log("=" * 50)
-        self.log(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 开始执行...")
+        self.log("=" * 50, "download")
+        self.log(f"开始执行...", "download")
 
         try:
-            self.log(f"正在连接 {cfg['imap_server']}:{cfg['imap_port']} ...")
+            self.log(f"正在连接 {cfg['imap_server']}:{cfg['imap_port']} ...", "download")
             mail = connect_imap(cfg["imap_server"], cfg["imap_port"],
                                 cfg["email_user"], cfg["email_pass"],
                                 cfg.get("skip_ssl_verify", False))
-            self.log("连接成功！")
+            self.log("连接成功！", "download")
 
             count = fetch_attachments(mail, filter_list,
-                                      cfg["save_folder"], self.log)
+                                      cfg["save_folder"],
+                                      lambda msg: self.log(msg, "download"))
             mail.logout()
-            self.log(f"本次下载了 {count} 个附件")
+            self.log(f"本次下载了 {count} 个附件", "download")
             if count == 0:
-                self.log("没有新的匹配附件")
+                self.log("没有新的匹配附件", "download")
 
         except imaplib.IMAP4.error as e:
-            self.log(f"IMAP错误: {e}")
+            self.log(f"IMAP错误: {e}", "download")
             messagebox.showerror("连接失败",
                                  f"IMAP登录失败，请检查服务器/端口/账号/授权码。\n错误: {e}")
         except Exception as e:
-            self.log(f"错误: {e}")
+            self.log(f"错误: {e}", "download")
             messagebox.showerror("执行出错", str(e))
 
-        self.log("=" * 50)
+        self.log("=" * 50, "download")
 
     def _test_send(self):
         """立即发送一封邮件（测试）"""
@@ -832,11 +915,11 @@ class MailAttachmentTool:
             messagebox.showerror("错误", "请填写收件人")
             return
 
-        self.log("=" * 50)
-        self.log(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 开始发送邮件...")
+        self.log("=" * 50, "send")
+        self.log(f"开始发送邮件...", "send")
 
         try:
-            self.log(f"正在连接 {cfg['smtp_server']}:{cfg['smtp_port']} ...")
+            self.log(f"正在连接 {cfg['smtp_server']}:{cfg['smtp_port']} ...", "send")
             att_paths = self._resolve_attachment_paths(cfg)
             send_email(
                 cfg["smtp_server"], cfg["smtp_port"], cfg["smtp_ssl"],
@@ -844,17 +927,17 @@ class MailAttachmentTool:
                 cfg["send_to"], cfg.get("send_subject", ""),
                 cfg.get("send_body", ""), att_paths,
                 cfg.get("skip_ssl_smtp", False),
-                self.log
+                lambda msg: self.log(msg, "send")
             )
-            self.log("发送成功！")
+            self.log("发送成功！", "send")
         except smtplib.SMTPAuthenticationError:
-            self.log("SMTP错误: 认证失败，请检查账号/密码/授权码")
+            self.log("SMTP错误: 认证失败，请检查账号/密码/授权码", "send")
             messagebox.showerror("发送失败", "SMTP认证失败，请检查账号/密码/授权码")
         except Exception as e:
-            self.log(f"发送出错: {e}")
+            self.log(f"发送出错: {e}", "send")
             messagebox.showerror("发送出错", str(e))
 
-        self.log("=" * 50)
+        self.log("=" * 50, "send")
 
     # ---------- 定时调度 ----------
     def _toggle_scheduler(self):
@@ -915,6 +998,11 @@ class MailAttachmentTool:
             day_names = [self.WEEKDAY_NAMES[d - 1] for d in sd["days"]]
             self.log(f"  [发送] {', '.join(day_names)} {sd['hour']:02d}:{sd['minute']:02d}:{sd['second']:02d}")
             self.log(f"  收件人: {cfg['send_to']}")
+        if cfg.get("log_export_enabled"):
+            ed = cfg.get("log_export_days", [])
+            if ed:
+                dn = [self.WEEKDAY_NAMES[d - 1] for d in ed]
+                self.log(f"  [日志导出] {', '.join(dn)} {cfg.get('log_export_hour',23):02d}:{cfg.get('log_export_minute',59):02d}:{cfg.get('log_export_second',0):02d}")
         self.log("=" * 50)
 
         self.scheduler_thread = threading.Thread(target=self._scheduler_loop, daemon=True)
@@ -933,6 +1021,7 @@ class MailAttachmentTool:
 
         last_dl_date = None
         last_sd_date = None
+        last_export_date = None
 
         while not self.stop_event.is_set():
             now = datetime.datetime.now()
@@ -961,13 +1050,24 @@ class MailAttachmentTool:
                     last_sd_date = today
                     self.root.after(0, self._execute_send)
 
+            # --- 日志导出任务 ---
+            if (cfg.get("log_export_enabled")
+                    and cfg.get("log_export_days", [])
+                    and weekday in set(cfg["log_export_days"])
+                    and now.hour == cfg.get("log_export_hour", 23)
+                    and now.minute == cfg.get("log_export_minute", 59)
+                    and now.second == cfg.get("log_export_second", 0)
+                    and last_export_date != today):
+                last_export_date = today
+                self.root.after(0, self._auto_export_log)
+
             time.sleep(0.5)
 
     def _execute_download(self):
         """在UI线程中执行下载"""
         cfg = self.config
-        self.log("=" * 50)
-        self.log(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 定时任务触发，开始下载...")
+        self.log("=" * 50, "download")
+        self.log(f"定时任务触发，开始下载...", "download")
 
         try:
             mail = connect_imap(cfg["imap_server"], cfg["imap_port"],
@@ -975,27 +1075,28 @@ class MailAttachmentTool:
                                 cfg.get("skip_ssl_verify", False))
             filter_list = cfg.get("sender_filter_list", [])
             count = fetch_attachments(mail, filter_list,
-                                      cfg["save_folder"], self.log)
+                                      cfg["save_folder"],
+                                      lambda msg: self.log(msg, "download"))
             mail.logout()
-            self.log(f"本次下载了 {count} 个附件")
+            self.log(f"本次下载了 {count} 个附件", "download")
             if count == 0:
-                self.log("没有新的匹配附件")
+                self.log("没有新的匹配附件", "download")
         except Exception as e:
-            self.log(f"执行出错: {e}")
+            self.log(f"执行出错: {e}", "download")
 
-        self.log("=" * 50)
+        self.log("=" * 50, "download")
 
     def _execute_send(self):
         """在UI线程中执行发送"""
         cfg = self.config
-        self.log("=" * 50)
-        self.log(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 定时发送触发...")
+        self.log("=" * 50, "send")
+        self.log(f"定时发送触发...", "send")
 
         send_user = cfg.get("send_user") or cfg["email_user"]
         send_pass = cfg.get("send_pass") or cfg["email_pass"]
 
         try:
-            self.log(f"正在连接 {cfg['smtp_server']}:{cfg['smtp_port']} ...")
+            self.log(f"正在连接 {cfg['smtp_server']}:{cfg['smtp_port']} ...", "send")
             att_paths = self._resolve_attachment_paths(cfg)
             send_email(
                 cfg["smtp_server"], cfg["smtp_port"], cfg["smtp_ssl"],
@@ -1003,18 +1104,28 @@ class MailAttachmentTool:
                 cfg["send_to"], cfg.get("send_subject", ""),
                 cfg.get("send_body", ""), att_paths,
                 cfg.get("skip_ssl_smtp", False),
-                self.log
+                lambda msg: self.log(msg, "send")
             )
-            self.log("发送成功！")
+            self.log("发送成功！", "send")
         except Exception as e:
-            self.log(f"发送出错: {e}")
+            self.log(f"发送出错: {e}", "send")
 
-        self.log("=" * 50)
+        self.log("=" * 50, "send")
 
-    # ---------- 日志 ----------
-    def log(self, msg):
+    # ---------- 日志（支持分类,筛选,导出） ----------
+    LOG_CATEGORIES = {"download": "[下载]", "send": "[发送]", "system": "[系统]"}
+
+    def log(self, msg, cat="system"):
+        """记录日志，cat: download / send / system"""
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        prefix = self.LOG_CATEGORIES.get(cat, "[系统]")
+        full = f"{prefix} {ts}  {msg}" if cat != "system" else msg
+        self.log_entries.append({"time": ts, "cat": cat, "msg": msg})
+        self._render_log(full)
+
+    def _render_log(self, line):
         self.log_text.config(state=tk.NORMAL)
-        self.log_text.insert(tk.END, msg + "\n")
+        self.log_text.insert(tk.END, line + "\n")
         self.log_text.see(tk.END)
         self.log_text.config(state=tk.DISABLED)
 
@@ -1022,6 +1133,67 @@ class MailAttachmentTool:
         self.log_text.config(state=tk.NORMAL)
         self.log_text.delete(1.0, tk.END)
         self.log_text.config(state=tk.DISABLED)
+        self.log_entries.clear()
+
+    def _apply_log_filter(self, category):
+        """筛选日志显示"""
+        self.log_filter = category
+        self.log_text.config(state=tk.NORMAL)
+        self.log_text.delete(1.0, tk.END)
+        self.log_text.config(state=tk.DISABLED)
+        for entry in self.log_entries:
+            if category == "all" or entry["cat"] == category:
+                ts = entry["time"]
+                prefix = self.LOG_CATEGORIES.get(entry["cat"], "[系统]")
+                line = f"{prefix} {ts}  {entry['msg']}" if entry["cat"] != "system" else entry["msg"]
+                self._render_log(line)
+
+    def _export_log(self):
+        """导出日志到文件（当前筛选或全部）"""
+        entries = self.log_entries
+        if self.log_filter != "all":
+            entries = [e for e in self.log_entries if e["cat"] == self.log_filter]
+        if not entries:
+            messagebox.showinfo("提示", "当前筛选条件下无日志可导出")
+            return
+        path = filedialog.asksaveasfilename(
+            title="导出日志", defaultextension=".txt",
+            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")],
+            initialfile=f"邮件工具日志_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        )
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8") as f:
+            for entry in entries:
+                ts = entry["time"]
+                prefix = self.LOG_CATEGORIES.get(entry["cat"], "[系统]")
+                line = f"{prefix} {ts}  {entry['msg']}" if entry["cat"] != "system" else entry["msg"]
+                f.write(line + "\n")
+        self.log(f"日志已导出 -> {path}")
+        messagebox.showinfo("导出完成", f"日志已保存到:\n{path}")
+
+    def _auto_export_log(self):
+        """定时自动导出全部日志"""
+        cfg = self.config
+        folder = cfg.get("log_export_folder", "")
+        if not folder:
+            folder = os.path.dirname(CONFIG_FILE)
+        os.makedirs(folder, exist_ok=True)
+        save_path = os.path.join(folder,
+            f"邮件工具日志_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+        with open(save_path, "w", encoding="utf-8") as f:
+            for entry in self.log_entries:
+                ts = entry["time"]
+                prefix = self.LOG_CATEGORIES.get(entry["cat"], "[系统]")
+                line = f"{prefix} {ts}  {entry['msg']}" if entry["cat"] != "system" else entry["msg"]
+                f.write(line + "\n")
+        self.log(f"日志已定时导出 -> {save_path}")
+
+    def _browse_export_folder(self):
+        folder = filedialog.askdirectory(title="选择日志导出目录")
+        if folder:
+            self.entry_export_folder.delete(0, tk.END)
+            self.entry_export_folder.insert(0, folder)
 
     # ---------- 系统托盘 ----------
     def _create_tray_image(self):
