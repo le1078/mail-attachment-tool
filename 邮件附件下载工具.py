@@ -18,6 +18,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
+from email.utils import formatdate, make_msgid
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
@@ -233,14 +234,22 @@ def fetch_attachments(mail, sender_filter_list, save_folder, log_func):
 def send_email(smtp_server, smtp_port, use_ssl, user, password, to_addr,
                subject, body, attachment_paths, skip_ssl_verify, log_func):
     """通过SMTP发送邮件（带附件），attachment_paths 为文件路径列表"""
+    # 解析收件人（去空格、去空串）
+    recipients = [r.strip() for r in to_addr.split(",") if r.strip()]
+    if not recipients:
+        raise ValueError("收件人列表为空")
+
     # 构建邮件
     msg = MIMEMultipart()
     msg["From"] = user
-    msg["To"] = to_addr
-    msg["Subject"] = subject
+    msg["To"] = ", ".join(recipients)
+    msg["Subject"] = subject or "(无主题)"
+    # 添加 Coremail 等服务器需要的标准头，避免 550 Mail rejected
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid()
 
-    # 正文
-    msg.attach(MIMEText(body, "plain", "utf-8"))
+    # 正文（无正文时间发一个空行，避免空邮件被拒）
+    msg.attach(MIMEText(body or " ", "plain", "utf-8"))
 
     # 附件（支持多个）
     total_size = 0
@@ -253,8 +262,9 @@ def send_email(smtp_server, smtp_port, use_ssl, user, password, to_addr,
                     part = MIMEBase("application", "octet-stream")
                     part.set_payload(f.read())
                 encoders.encode_base64(part)
-                part.add_header("Content-Disposition",
-                                f'attachment; filename="{filename}"')
+                # 文件名使用 RFC 5987 编码，兼容中文和特殊字符
+                part.add_header("Content-Disposition", "attachment",
+                                filename=("utf-8", "", filename))
                 msg.attach(part)
                 total_size += file_size
                 log_func(f"  附件: {filename} ({file_size} 字节)")
@@ -273,9 +283,10 @@ def send_email(smtp_server, smtp_port, use_ssl, user, password, to_addr,
         server.ehlo()
 
     server.login(user, password)
-    server.sendmail(user, to_addr.split(","), msg.as_string())
+    # from_addr 必须与登录用户一致，否则 Coremail 会 550 拒绝
+    server.sendmail(user, recipients, msg.as_string())
     server.quit()
-    log_func(f"  邮件已发送 -> {to_addr}")
+    log_func(f"  邮件已发送 -> {', '.join(recipients)}")
 
 
 # ==================== GUI ====================
