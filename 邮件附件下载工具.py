@@ -103,7 +103,11 @@ def decode_str(s):
     """解码邮件头"""
     if s is None:
         return ""
-    decoded_parts = decode_header(s)
+    try:
+        decoded_parts = decode_header(s)
+    except RecursionError:
+        # 某些畸形邮件头会导致 decode_header 无限递归，兜底返回原始字符串
+        return str(s) if isinstance(s, str) else s.decode("utf-8", errors="replace")
     result = []
     for part, charset in decoded_parts:
         if isinstance(part, bytes):
@@ -128,7 +132,7 @@ def decode_attachment_filename(part):
     - RFC 2231: charset'language'encoded
     - 原始 GBK/GB2312/GB18030 字节
     """
-    filename = decode_attachment_filename(part)
+    filename = part.get_filename()
     if not filename:
         return None
 
