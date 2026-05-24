@@ -99,16 +99,27 @@ def clean_filename(name):
     return re.sub(r'[\\/:*?"<>|]', "_", name)
 
 
-def connect_imap(server, port, user, password, skip_ssl_verify=False):
-    """连接IMAP服务器"""
-    if skip_ssl_verify:
-        # 内网自签名证书：跳过SSL证书验证
-        ctx = ssl.create_default_context()
+# ==================== SSL兼容处理 ====================
+def _create_ssl_context(skip_verify=False):
+    """创建兼容的SSL上下文，解决Python 3.12+ SSL handshake failure"""
+    # 使用PROTOCOL_TLS_CLIENT自动协商最佳协议
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    # 兼容旧服务器的cipher suite
+    ctx.set_ciphers("DEFAULT:@SECLEVEL=1")
+    # 允许传统重协商（Coremail等旧服务器需要）
+    ctx.options |= ssl.OP_LEGACY_SERVER_CONNECT
+    ctx.options |= ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3  # 禁用不安全协议
+
+    if skip_verify:
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-        mail = imaplib.IMAP4_SSL(server, port, ssl_context=ctx)
-    else:
-        mail = imaplib.IMAP4_SSL(server, port)
+    return ctx
+
+
+def connect_imap(server, port, user, password, skip_ssl_verify=False):
+    """连接IMAP服务器"""
+    ctx = _create_ssl_context(skip_verify=skip_ssl_verify)
+    mail = imaplib.IMAP4_SSL(server, port, ssl_context=ctx)
     mail.login(user, password)
     return mail
 
@@ -254,18 +265,13 @@ def send_email(smtp_server, smtp_port, use_ssl, user, password, to_addr,
         log_func("  无附件")
 
     # 发送
+    ctx = _create_ssl_context(skip_verify=skip_ssl_verify)
     if use_ssl:
-        if skip_ssl_verify:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            server = smtplib.SMTP_SSL(smtp_server, smtp_port, context=ctx)
-        else:
-            server = smtplib.SMTP_SSL(smtp_server, smtp_port)
+        server = smtplib.SMTP_SSL(smtp_server, smtp_port, context=ctx)
     else:
         server = smtplib.SMTP(smtp_server, smtp_port)
         server.ehlo()
-        server.starttls()
+        server.starttls(context=ctx)
         server.ehlo()
 
     server.login(user, password)
