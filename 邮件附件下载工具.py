@@ -127,42 +127,83 @@ def clean_filename(name):
 
 def decode_attachment_filename(part):
     """
-    稳健解码附件文件名，处理各种中文编码：
-    - RFC 2047: =?charset?B?...?=
-    - RFC 2231: charset'language'encoded
-    - 原始 GBK/GB2312/GB18030 字节
+    稳健解码附件文件名，支持多种编码方式：
+    - RFC 2231: charset'language'encoded → get_filename() 已处理
+    - RFC 2047: =?charset?B?...?= → decode_header 处理
+    - Content-Type name 参数（部分邮件客户端把文件名放这里）
+    - 原始 GBK/GB2312/GB18030/UTF-8 字节
     """
-    filename = part.get_filename()
-    if not filename:
-        return None
 
-    # 先尝试 decode_header（处理 RFC 2047）
-    decoded = decode_str(filename)
+    def _decode_raw(raw_name):
+        """解码原始文件名字符串，尝试多种编码"""
+        if not raw_name:
+            return None
+        # 1. 先尝试 RFC 2047 解码
+        decoded = decode_str(raw_name)
+        if '\ufffd' not in decoded:
+            return decoded
 
-    # 如果结果含乱码替换字符，说明是原始字节被错误解码了
-    if '\ufffd' in decoded or '\\x' in repr(decoded):
-        # 尝试从原始字节恢复
-        raw_bytes = None
-        if isinstance(filename, str):
-            try:
-                raw_bytes = filename.encode('latin-1')
-            except UnicodeEncodeError:
-                raw_bytes = filename.encode('utf-8', errors='surrogateescape')
-        else:
-            raw_bytes = filename
-
-        if raw_bytes:
-            # 依次尝试常见中文编码
-            for enc in ['gb18030', 'gbk', 'gb2312', 'utf-8', 'big5']:
+        # 2. 有乱码，尝试原始字节恢复
+        if isinstance(raw_name, str):
+            # 把 Python 内部表示转回原始字节
+            for enc in ['latin-1', 'utf-8']:
                 try:
-                    trial = raw_bytes.decode(enc)
-                    if '\ufffd' not in trial:
-                        decoded = trial
-                        break
-                except (UnicodeDecodeError, UnicodeError, LookupError):
+                    raw_bytes = raw_name.encode(enc, errors='surrogateescape')
+                    break
+                except (UnicodeEncodeError, UnicodeDecodeError):
                     continue
+            else:
+                raw_bytes = raw_name.encode('utf-8', errors='replace')
+        else:
+            raw_bytes = raw_name
 
-    return decoded
+        # 依次尝试常见中文编码
+        for enc in ['gb18030', 'gbk', 'gb2312', 'utf-8', 'big5', 'latin-1']:
+            try:
+                trial = raw_bytes.decode(enc)
+                if '\ufffd' not in trial:
+                    return trial
+            except Exception:
+                continue
+        return decoded
+
+    # ---- 方法1：get_filename() 处理 RFC 2231 ----
+    filename = part.get_filename()
+    if filename:
+        return _decode_raw(filename)
+
+    # ---- 方法2：手动解析 Content-Disposition 和 Content-Type ----
+    cd = str(part.get("Content-Disposition", ""))
+    ct = str(part.get("Content-Type", ""))
+
+    # 收集所有候选文件名
+    candidates = []
+    # RFC 2231 扩展格式: filename*=charset'lang'encoded
+    m = re.search(r"filename\*\s*=\s*([^;'\"]*'[^;'\"]*'[^;'\"]*)", cd, re.IGNORECASE)
+    if m:
+        candidates.append(m.group(1).strip().strip('"'))
+    # 标准格式: filename="..."
+    m = re.search(r'filename\s*=\s*"([^"]*)"', cd, re.IGNORECASE)
+    if m:
+        candidates.append(m.group(1))
+    # 无引号格式: filename=xxx
+    m = re.search(r'filename\s*=\s*([^;"\s]+)', cd, re.IGNORECASE)
+    if m and '"' not in m.group(0):
+        candidates.append(m.group(1))
+    # Content-Type name (某些客户端)
+    m = re.search(r'name\s*=\s*"([^"]*)"', ct, re.IGNORECASE)
+    if m:
+        candidates.append(m.group(1))
+    m = re.search(r"name\*\s*=\s*([^;'\"]*'[^;'\"]*'[^;'\"]*)", ct, re.IGNORECASE)
+    if m:
+        candidates.append(m.group(1).strip().strip('"'))
+
+    for c in candidates:
+        result = _decode_raw(c)
+        if result:
+            return result
+
+    return None
 
 
 # ==================== SSL兼容处理 ====================
@@ -303,35 +344,40 @@ def fetch_attachments(mail, sender_filter_list, save_folder, log_func,
                         content_disposition = str(part.get("Content-Disposition", ""))
                         if "attachment" in content_disposition:
                             filename = decode_attachment_filename(part)
-                            if filename:
-                                filename = clean_filename(filename)
-                                filepath = os.path.join(save_folder, filename)
-                                # 处理重名：追加下载时间戳
-                                if os.path.exists(filepath):
-                                    base, ext = os.path.splitext(filename)
-                                    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                                    filepath = os.path.join(save_folder, f"{base}_{ts}{ext}")
-                                with open(filepath, "wb") as f:
-                                    f.write(part.get_payload(decode=True))
-                                log_func(f"    -> 已下载: {os.path.basename(filepath)}")
-                                download_count += 1
+                            if not filename:
+                                # 解码失败，记录原始头信息便于排查
+                                log_func(f"   ⚠ 附件解码失败，Content-Disposition: {content_disposition}, Content-Type: {part.get('Content-Type', '')}")
+                                continue
+                            filename = clean_filename(filename)
+                            filepath = os.path.join(save_folder, filename)
+                            # 处理重名：追加下载时间戳
+                            if os.path.exists(filepath):
+                                base, ext = os.path.splitext(filename)
+                                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                                filepath = os.path.join(save_folder, f"{base}_{ts}{ext}")
+                            with open(filepath, "wb") as f:
+                                f.write(part.get_payload(decode=True))
+                            log_func(f"    -> 已下载: {os.path.basename(filepath)}")
+                            download_count += 1
                 else:
                     # 非multipart也可能是附件
                     content_type = msg.get_content_type()
                     content_disposition = str(msg.get("Content-Disposition", ""))
                     if "attachment" in content_disposition:
                         filename = decode_attachment_filename(msg)
-                        if filename:
-                            filename = clean_filename(filename)
-                            filepath = os.path.join(save_folder, filename)
-                            if os.path.exists(filepath):
-                                base, ext = os.path.splitext(filename)
-                                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                                filepath = os.path.join(save_folder, f"{base}_{ts}{ext}")
-                            with open(filepath, "wb") as f:
-                                f.write(msg.get_payload(decode=True))
-                            log_func(f"    -> 已下载: {os.path.basename(filepath)}")
-                            download_count += 1
+                        if not filename:
+                            log_func(f"   ⚠ 附件解码失败，Content-Disposition: {content_disposition}, Content-Type: {msg.get('Content-Type', '')}")
+                            continue
+                        filename = clean_filename(filename)
+                        filepath = os.path.join(save_folder, filename)
+                        if os.path.exists(filepath):
+                            base, ext = os.path.splitext(filename)
+                            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                            filepath = os.path.join(save_folder, f"{base}_{ts}{ext}")
+                        with open(filepath, "wb") as f:
+                            f.write(msg.get_payload(decode=True))
+                        log_func(f"    -> 已下载: {os.path.basename(filepath)}")
+                        download_count += 1
 
                 new_processed.add(mail_id_str)
 
