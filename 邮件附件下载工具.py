@@ -37,6 +37,7 @@ DEFAULT_CONFIG = {
     "email_pass": "",
     "sender_filter_list": [],    # 发件人筛选列表，一行一个
     "download_keyword_filter": "",  # 邮件主题关键词筛选
+    "download_read_status": "all",  # 已读/未读筛选: all / unseen / seen
     "save_folder": "",
     "skip_ssl_verify": False,
     "schedule_download": {
@@ -186,7 +187,7 @@ def connect_imap(server, port, user, password, skip_ssl_verify=False):
 
 
 def fetch_attachments(mail, sender_filter_list, save_folder, log_func,
-                      keyword_filter="",
+                      keyword_filter="", read_status="all",
                       filter_days=None, filter_time_enabled=False,
                       filter_time_start="00:00", filter_time_end="23:59",
                       filter_date_enabled=False, filter_date_start="", filter_date_end=""):
@@ -194,13 +195,20 @@ def fetch_attachments(mail, sender_filter_list, save_folder, log_func,
     从收件箱中查找符合条件的邮件，下载附件
     sender_filter_list: 发件人筛选列表（每个元素是一个关键词），空=不限发件人
     keyword_filter: 主题关键词筛选，空=不限关键词
+    read_status: 已读/未读筛选: "all" / "unseen" / "seen"
     filter_days: 仅下载这些星期几（1=周一..7=周日）的邮件，None/空=不限
     filter_time_start, filter_time_end: 仅下载此时间段内的邮件（HH:MM），filter_time_enabled=False=不限
     filter_date_start, filter_date_end: 仅下载此日期范围内的邮件（YYYY-MM-DD），filter_date_enabled=False=不限
     """
     mail.select("INBOX")
-    # 搜索所有邮件
-    status, messages = mail.search(None, "ALL")
+    # 搜索邮件：根据 read_status 使用不同 IMAP 搜索条件
+    if read_status == "unseen":
+        search_criteria = "UNSEEN"
+    elif read_status == "seen":
+        search_criteria = "SEEN"
+    else:
+        search_criteria = "ALL"
+    status, messages = mail.search(None, search_criteria)
     if status != "OK":
         log_func("搜索邮件失败")
         return 0
@@ -210,7 +218,7 @@ def fetch_attachments(mail, sender_filter_list, save_folder, log_func,
         log_func("收件箱为空")
         return 0
 
-    log_func(f"收件箱共 {len(mail_ids)} 封邮件，筛选条件: 发件人={sender_filter_list}, 关键词={keyword_filter or '无'}，开始扫描...")
+    log_func(f"收件箱共 {len(mail_ids)} 封邮件，筛选条件: 发件人={sender_filter_list}, 关键词={keyword_filter or '无'}, 状态={read_status}，开始扫描...")
     download_count = 0
 
     # 只检查最近的邮件（避免每次都扫描全部）
@@ -490,6 +498,15 @@ class MailAttachmentTool:
         self.entry_keyword = ttk.Entry(dl_inner, width=35)
         self.entry_keyword.grid(row=row, column=1, sticky=tk.W, pady=2, padx=(5, 0))
         ttk.Label(dl_inner, text="(筛选主题含此关键词的邮件，与发件人可共用)", foreground="gray").grid(
+            row=row, column=2, sticky=tk.W, pady=2, padx=5)
+        row += 1
+
+        ttk.Label(dl_inner, text="已读/未读:").grid(row=row, column=0, sticky=tk.W, pady=2)
+        self.combo_read_status = ttk.Combobox(dl_inner, width=12, state="readonly",
+                                              values=["全部邮件", "仅未读", "仅已读"])
+        self.combo_read_status.grid(row=row, column=1, sticky=tk.W, pady=2, padx=(5, 0))
+        self.combo_read_status.set("全部邮件")
+        ttk.Label(dl_inner, text="(筛选已读/未读状态的邮件)", foreground="gray").grid(
             row=row, column=2, sticky=tk.W, pady=2, padx=5)
         row += 1
 
@@ -851,6 +868,10 @@ class MailAttachmentTool:
         self.entry_sender.insert(0, ", ".join(filter_list))
         self.entry_keyword.delete(0, tk.END)
         self.entry_keyword.insert(0, cfg.get("download_keyword_filter", ""))
+        # 已读/未读筛选
+        rs = cfg.get("download_read_status", "all")
+        rs_map = {"all": "全部邮件", "unseen": "仅未读", "seen": "仅已读"}
+        self.combo_read_status.set(rs_map.get(rs, "全部邮件"))
         self.entry_folder.delete(0, tk.END)
         self.entry_folder.insert(0, cfg.get("save_folder", ""))
 
@@ -951,6 +972,7 @@ class MailAttachmentTool:
                     s.strip() for s in self.entry_sender.get().split(",") if s.strip()
                 ],
                 "download_keyword_filter": self.entry_keyword.get().strip(),
+                "download_read_status": {"全部邮件": "all", "仅未读": "unseen", "仅已读": "seen"}.get(self.combo_read_status.get(), "all"),
                 "save_folder": self.entry_folder.get().strip(),
                 "skip_ssl_verify": self.var_skip_ssl.get(),
                 "schedule_download": {
@@ -1015,6 +1037,7 @@ class MailAttachmentTool:
                 s.strip() for s in self.entry_sender.get().split(",") if s.strip()
             ],
             "download_keyword_filter": self.entry_keyword.get().strip(),
+            "download_read_status": {"全部邮件": "all", "仅未读": "unseen", "仅已读": "seen"}.get(self.combo_read_status.get(), "all"),
             "save_folder": self.entry_folder.get().strip(),
             "skip_ssl_verify": self.var_skip_ssl.get(),
             "schedule_download": {
@@ -1043,6 +1066,7 @@ class MailAttachmentTool:
         self.entry_pass.delete(0, tk.END)
         self.entry_sender.delete(0, tk.END)
         self.entry_keyword.delete(0, tk.END)
+        self.combo_read_status.set("全部邮件")
         self.entry_folder.delete(0, tk.END)
         self.var_skip_ssl.set(False)
         self.var_dl_enabled.set(False)
@@ -1198,12 +1222,14 @@ class MailAttachmentTool:
             filter_days = cfg.get("download_filter_days", [])
             filter_time_enabled = cfg.get("download_filter_time_enabled", False)
             filter_date_enabled = cfg.get("download_filter_date_enabled", False)
+            read_status = cfg.get("download_read_status", "all")
             if filter_days or filter_time_enabled or filter_date_enabled:
                 self.log(f"邮件筛选: 接收日={filter_days}, 时间段={'启用' if filter_time_enabled else '不启用'}, 日期范围={'启用' if filter_date_enabled else '不启用'}", "download")
             count = fetch_attachments(mail, filter_list,
                                       cfg["save_folder"],
                                       lambda msg: self.log(msg, "download"),
                                       keyword_filter=keyword_filter,
+                                      read_status=read_status,
                                       filter_days=filter_days if filter_days else None,
                                       filter_time_enabled=filter_time_enabled,
                                       filter_time_start=cfg.get("download_filter_time_start", "00:00"),
@@ -1407,12 +1433,14 @@ class MailAttachmentTool:
             filter_time_enabled = cfg.get("download_filter_time_enabled", False)
             filter_date_enabled = cfg.get("download_filter_date_enabled", False)
             keyword_filter = cfg.get("download_keyword_filter", "").strip()
+            read_status = cfg.get("download_read_status", "all")
             if filter_days or filter_time_enabled or filter_date_enabled:
                 self.log(f"邮件筛选: 接收日={filter_days}, 时间段={'启用' if filter_time_enabled else '不启用'}, 日期范围={'启用' if filter_date_enabled else '不启用'}", "download")
             count = fetch_attachments(mail, filter_list,
                                       cfg["save_folder"],
                                       lambda msg: self.log(msg, "download"),
                                       keyword_filter=keyword_filter,
+                                      read_status=read_status,
                                       filter_days=filter_days if filter_days else None,
                                       filter_time_enabled=filter_time_enabled,
                                       filter_time_start=cfg.get("download_filter_time_start", "00:00"),
