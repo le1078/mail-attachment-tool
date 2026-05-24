@@ -305,7 +305,7 @@ class MailAttachmentTool:
 
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("邮件附件下载 & 定时发送工具 v3.1")
+        self.root.title("邮件自动化工具")
         self.root.geometry("720x680")
         self.root.resizable(True, True)
 
@@ -330,7 +330,7 @@ class MailAttachmentTool:
         main_frame.pack(fill=tk.BOTH, expand=True)
 
         # --- 标题 ---
-        title = ttk.Label(main_frame, text="邮件附件下载 & 定时发送工具",
+        title = ttk.Label(main_frame, text="邮件附件定时下载 & 邮件定时发送",
                           font=("Microsoft YaHei", 14, "bold"))
         title.pack(pady=(0, 10))
 
@@ -439,8 +439,14 @@ class MailAttachmentTool:
         self.spin_sec.pack(side=tk.LEFT, padx=(2, 5)); self.spin_sec.set("0")
         row += 1
 
-        ttk.Button(dl_inner, text="测试连接 & 立即执行一次", command=self._test_and_run,
-                   width=25).grid(row=row, column=0, columnspan=3, pady=8)
+        dl_btn_frame = ttk.Frame(dl_inner)
+        dl_btn_frame.grid(row=row, column=0, columnspan=3, pady=8)
+        ttk.Button(dl_btn_frame, text="立即执行一次", command=self._test_and_run,
+                   width=16).pack(side=tk.LEFT, padx=3)
+        ttk.Button(dl_btn_frame, text="保存配置", command=self._save_download_config,
+                   width=12).pack(side=tk.LEFT, padx=3)
+        ttk.Button(dl_btn_frame, text="清除配置", command=self._clear_download_config,
+                   width=12).pack(side=tk.LEFT, padx=3)
 
         # ================================================================
         # Tab 2: 发送配置（SMTP + 定时）
@@ -506,8 +512,14 @@ class MailAttachmentTool:
         srow += 1
 
         ttk.Label(send_inner, text="邮件正文:").grid(row=srow, column=0, sticky=tk.NW, pady=2)
-        self.text_send_body = tk.Text(send_inner, width=35, height=3)
-        self.text_send_body.grid(row=srow, column=1, sticky=tk.W, pady=2, padx=(5, 0))
+        body_frame = ttk.Frame(send_inner)
+        body_frame.grid(row=srow, column=1, columnspan=2, sticky=tk.EW, pady=2, padx=(5, 0))
+        self.text_send_body = tk.Text(body_frame, width=35, height=5, wrap=tk.WORD,
+                                       font=("", 9))
+        self.text_send_body.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        body_scroll = ttk.Scrollbar(body_frame, command=self.text_send_body.yview)
+        body_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.text_send_body.config(yscrollcommand=body_scroll.set)
         srow += 1
 
         # 附件
@@ -574,8 +586,14 @@ class MailAttachmentTool:
         self.spin_send_sec.pack(side=tk.LEFT, padx=(2, 5)); self.spin_send_sec.set("0")
         srow += 1
 
-        ttk.Button(send_inner, text="立即发送一次（测试）", command=self._test_send,
-                   width=22).grid(row=srow, column=0, columnspan=3, pady=8)
+        sd_btn_frame = ttk.Frame(send_inner)
+        sd_btn_frame.grid(row=srow, column=0, columnspan=3, pady=8)
+        ttk.Button(sd_btn_frame, text="立即执行一次", command=self._test_send,
+                   width=16).pack(side=tk.LEFT, padx=3)
+        ttk.Button(sd_btn_frame, text="保存配置", command=self._save_send_config,
+                   width=12).pack(side=tk.LEFT, padx=3)
+        ttk.Button(sd_btn_frame, text="清除配置", command=self._clear_send_config,
+                   width=12).pack(side=tk.LEFT, padx=3)
 
         # ================================================================
         # Tab 3: 运行日志
@@ -653,7 +671,7 @@ class MailAttachmentTool:
                                      command=self._toggle_scheduler, width=16)
         self.btn_start.pack(side=tk.RIGHT, padx=5)
 
-        ttk.Button(bottom_frame, text="保存配置", command=self._save_ui_config,
+        ttk.Button(bottom_frame, text="全部应用配置", command=self._save_ui_config,
                    width=12).pack(side=tk.RIGHT, padx=5)
 
     # ---------- 配置加载/保存 ----------
@@ -798,6 +816,95 @@ class MailAttachmentTool:
             self.log("配置已保存")
         except ValueError:
             messagebox.showerror("错误", "端口/时间必须是数字")
+
+    # ---------- 独立保存/清除 ----------
+    def _save_download_config(self):
+        """仅保存下载页配置"""
+        dl_days = [i + 1 for i, var in enumerate(self.day_vars) if var.get()]
+        self.config.update({
+            "imap_server": self.entry_server.get().strip(),
+            "imap_port": int(self.entry_port.get().strip() or "993"),
+            "email_user": self.entry_user.get().strip(),
+            "email_pass": self.entry_pass.get().strip(),
+            "sender_filter": "",
+            "sender_filter_list": [
+                s.strip() for s in self.entry_sender.get().split(",") if s.strip()
+            ],
+            "save_folder": self.entry_folder.get().strip(),
+            "skip_ssl_verify": self.var_skip_ssl.get(),
+            "schedule_download": {
+                "days": dl_days,
+                "hour": int(self.spin_hour.get()),
+                "minute": int(self.spin_min.get()),
+                "second": int(self.spin_sec.get()),
+                "enabled": self.var_dl_enabled.get()
+            }
+        })
+        save_config(self.config)
+        self.log("下载配置已保存")
+
+    def _clear_download_config(self):
+        """清除下载页所有配置"""
+        self.entry_server.delete(0, tk.END)
+        self.entry_port.delete(0, tk.END); self.entry_port.insert(0, "993")
+        self.entry_user.delete(0, tk.END)
+        self.entry_pass.delete(0, tk.END)
+        self.entry_sender.delete(0, tk.END)
+        self.entry_folder.delete(0, tk.END)
+        self.var_skip_ssl.set(False)
+        self.var_dl_enabled.set(False)
+        for var in self.day_vars:
+            var.set(False)
+        self.spin_hour.set("9"); self.spin_min.set("0"); self.spin_sec.set("0")
+        self._save_download_config()
+        self.log("下载配置已清除")
+
+    def _save_send_config(self):
+        """仅保存发送页配置"""
+        sd_days = [i + 1 for i, var in enumerate(self.send_day_vars) if var.get()]
+        self.config.update({
+            "smtp_server": self.entry_smtp_server.get().strip(),
+            "smtp_port": int(self.entry_smtp_port.get().strip() or "465"),
+            "smtp_ssl": self.var_smtp_ssl.get(),
+            "skip_ssl_smtp": self.var_skip_ssl_smtp.get(),
+            "send_user": self.entry_send_user.get().strip(),
+            "send_pass": self.entry_send_pass.get().strip(),
+            "send_to": self.entry_send_to.get().strip(),
+            "send_subject": self.entry_send_subject.get().strip(),
+            "send_body": self.text_send_body.get(1.0, tk.END).strip(),
+            "send_attachment_mode": self.var_att_mode.get(),
+            "send_attachment": self.entry_send_attachment.get().strip() if self.var_att_mode.get() == "single" else "",
+            "send_attachment_list": self._get_attachment_list_from_ui() if self.var_att_mode.get() != "single" else [],
+            "schedule_send": {
+                "days": sd_days,
+                "hour": int(self.spin_send_hour.get()),
+                "minute": int(self.spin_send_min.get()),
+                "second": int(self.spin_send_sec.get()),
+                "enabled": self.var_sd_enabled.get()
+            }
+        })
+        save_config(self.config)
+        self.log("发送配置已保存")
+
+    def _clear_send_config(self):
+        """清除发送页所有配置"""
+        self.entry_smtp_server.delete(0, tk.END)
+        self.entry_smtp_port.delete(0, tk.END); self.entry_smtp_port.insert(0, "465")
+        self.var_smtp_ssl.set(True)
+        self.var_skip_ssl_smtp.set(False)
+        self.entry_send_user.delete(0, tk.END)
+        self.entry_send_pass.delete(0, tk.END)
+        self.entry_send_to.delete(0, tk.END)
+        self.entry_send_subject.delete(0, tk.END)
+        self.text_send_body.delete(1.0, tk.END)
+        self.entry_send_attachment.delete(0, tk.END)
+        self.var_att_mode.set("single")
+        self.var_sd_enabled.set(False)
+        for var in self.send_day_vars:
+            var.set(False)
+        self.spin_send_hour.set("8"); self.spin_send_min.set("0"); self.spin_send_sec.set("0")
+        self._save_send_config()
+        self.log("发送配置已清除")
 
     def _browse_folder(self):
         path = filedialog.askdirectory(title="选择附件保存目录")
@@ -1226,7 +1333,7 @@ class MailAttachmentTool:
             self.tray_icon = pystray.Icon(
                 "mail_tool",
                 self._create_tray_image(),
-                "邮件附件下载工具",
+                "邮件自动化工具",
                 menu=pystray.Menu(
                     pystray.MenuItem("显示窗口", self._show_window, default=True),
                     pystray.MenuItem("退出程序", self._tray_exit)
