@@ -19,7 +19,9 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
 from email.utils import formatdate, make_msgid, parsedate_to_datetime
+from email.policy import compat32
 from pathlib import Path
+from urllib.parse import unquote
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
@@ -122,128 +124,282 @@ def decode_str(s):
 
 def clean_filename(name):
     """清理文件名中的非法字符"""
-    return re.sub(r'[\\/:*?"<>|]', "_", name)
+    # 替换 Windows 非法字符
+    name = re.sub(r'[\\/:*?"<>|]', "_", name)
+    # 去除控制字符 (0x00-0x1F)
+    name = re.sub(r'[\x00-\x1f]', "", name)
+    # 去除首尾空白和点号（Windows 不允许以点结尾）
+    name = name.strip(" .")
+    if not name:
+        name = "unnamed"
+    return name
+
+
+def _try_decode_bytes(raw_bytes):
+    """尝试用多种编码解码字节序列，返回最佳结果"""
+    for enc in ['utf-8', 'gb18030', 'gbk', 'gb2312', 'big5', 'latin-1']:
+        try:
+            trial = raw_bytes.decode(enc)
+            if '\ufffd' not in trial:
+                return trial
+        except Exception:
+            continue
+    # 兜底：utf-8 with replace
+    return raw_bytes.decode('utf-8', errors='replace')
+
+
+def _parse_rfc2231_value(raw_value):
+    """
+    解析 RFC 2231 编码的参数值，格式: charset'language'percent_encoded_value
+    返回解码后的 Unicode 字符串，解析失败返回 None
+    """
+    # 匹配 charset'language'value 模式
+    m = re.match(r"([A-Za-z0-9_-]+)'([^']*)'(.+)", raw_value, re.DOTALL)
+    if not m:
+        return None
+    charset = m.group(1)
+    # language 部分通常为空，忽略
+    encoded_value = m.group(3)
+    # 先做 percent-decode
+    try:
+        decoded_bytes = unquote(encoded_value).encode('latin-1')
+    except Exception:
+        try:
+            decoded_bytes = unquote(encoded_value).encode('raw_unicode_escape')
+        except Exception:
+            return None
+    # 再按 charset 解码
+    try:
+        result = decoded_bytes.decode(charset, errors='replace')
+        if '\ufffd' not in result:
+            return result
+    except Exception:
+        pass
+    # charset 解码失败，尝试其他常见编码
+    return _try_decode_bytes(decoded_bytes) or None
+
+
+def _get_raw_header_bytes(part, header_name):
+    """
+    从邮件 part 的原始数据中提取指定 header 的原始字节。
+    Python 3 的 email 模块会将 header 解码为 str，丢失原始编码信息。
+    此函数通过访问 part 的内部原始数据来获取未解码的字节。
+    """
+    # 方法1：尝试从 as_bytes 重新解析
+    try:
+        if hasattr(part, '_payload') and isinstance(part._payload, bytes):
+            raw = part._payload
+        else:
+            return None
+    except Exception:
+        return None
+    return None  # 此方法不可靠，回退
 
 
 def decode_attachment_filename(part):
     """
-    万能附件文件名解码，攻关乱码问题：
-    1. 优先从 part._headers 获取原始header字节（绕过email模块的干扰）
-    2. 回退到 get_filename() / 手动解析Content-Disposition/Content-Type
+    万能附件文件名解码，修复乱码问题：
+    1. 优先解析 RFC 2231 filename* 参数（percent-encoding）
+    2. 从原始邮件字节中提取 filename（绕过 email 模块的预解码）
+    3. 回退到 get_filename() / 手动解析 Content-Disposition/Content-Type
     """
 
-    def _decode_name(raw):
-        """解码一个原始名称（str或bytes）"""
-        if isinstance(raw, bytes):
-            # 原始字节！直接用多种编码尝试
-            for enc in ['gb18030', 'gbk', 'gb2312', 'utf-8', 'big5', 'latin-1']:
-                try:
-                    trial = raw.decode(enc)
-                    if '\ufffd' not in trial:
-                        return trial
-                except Exception:
-                    continue
-            return raw.decode('utf-8', errors='replace')
-
-        if not raw or not isinstance(raw, str):
-            return None
-
-        # 先RFC 2047 decode
-        decoded = decode_str(raw)
-        if '\ufffd' not in decoded:
-            return decoded
-
-        # 有乱码，尝试把已损坏的Unicode转回原始字节
-        for recovery_enc in ['latin-1', 'cp1252', 'utf-8']:
-            try:
-                bs = raw.encode(recovery_enc, errors='surrogateescape')
-                if any(b > 127 for b in bs):
-                    for enc in ['gb18030', 'gbk', 'gb2312', 'utf-8', 'big5']:
-                        try:
-                            trial = bs.decode(enc)
-                            if '\ufffd' not in trial:
-                                return trial
-                        except Exception:
-                            continue
-            except Exception:
-                continue
-        return decoded
-
-    # ---- 方法0：直接从 _headers 获取原始值 ----
+    # ---- 收集所有 header 的原始文本 ----
+    cd_value = ""
+    ct_value = ""
     if hasattr(part, '_headers'):
         for h_name, h_val in part._headers:
             if h_name.lower() == 'content-disposition':
-                cd_raw = h_val  # 可能是str/bytes/Header对象
-                break
+                cd_value = h_val
+            elif h_name.lower() == 'content-type':
+                ct_value = h_val
+    if not cd_value:
+        cd_value = part.get('Content-Disposition', '')
+    if not ct_value:
+        ct_value = part.get('Content-Type', '')
+
+    # ---- 优先级1：RFC 2231 filename* (最规范的中文附件名编码方式) ----
+    # 格式: filename*=charset'lang'percent_encoded_value
+    # 也支持延续段: filename*0*=..., filename*1*=...
+    rfc2231_parts = {}
+    rfc2231_charset = None
+
+    # 从 Content-Disposition 中提取所有 filename* 相关参数
+    # 匹配 filename*=, filename*0*=, filename*1*= 等
+    for m in re.finditer(
+        r"filename(\*(\d+))?\*\s*=\s*([^;]+)",
+        cd_value, re.IGNORECASE
+    ):
+        full_key = m.group(0)
+        seg_index = int(m.group(2)) if m.group(2) is not None else -1
+        raw_val = m.group(3).strip().strip('"')
+
+        # 首次遇到或无编号的 filename*
+        if seg_index == -1:
+            # 完整的 filename*=charset'lang'value
+            decoded = _parse_rfc2231_value(raw_val)
+            if decoded and '\ufffd' not in decoded:
+                return decoded
         else:
-            cd_raw = part.get('Content-Disposition', '')
-    else:
-        cd_raw = part.get('Content-Disposition', '')
+            rfc2231_parts[seg_index] = raw_val
 
-    # 从 Content-Disposition 头提取 filename 参数
-    # 支持: filename="...", filename=xxx, filename*=charset'lang'encoded
-    cd_str = str(cd_raw)
+    # 处理分段 filename*0*=, filename*1*= ...
+    if rfc2231_parts:
+        # 第一段包含 charset 信息
+        sorted_indices = sorted(rfc2231_parts.keys())
+        first_val = rfc2231_parts[sorted_indices[0]]
+        m_charset = re.match(r"([A-Za-z0-9_-]+)'([^']*)'(.+)", first_val, re.DOTALL)
+        if m_charset:
+            rfc2231_charset = m_charset.group(1)
+            # 修正第一段：去掉 charset'lang' 前缀
+            rfc2231_parts[sorted_indices[0]] = m_charset.group(3)
 
-    # 先尝试从原始值直接提取（可能保留更多原始字节信息）
-    if isinstance(cd_raw, bytes):
-        # 从原始字节中提取filename
+        # 拼接所有段的 percent-encoded 值
+        combined = "".join(rfc2231_parts[i] for i in sorted_indices if i in rfc2231_parts)
+        try:
+            decoded_bytes = unquote(combined).encode('latin-1')
+            if rfc2231_charset:
+                result = decoded_bytes.decode(rfc2231_charset, errors='replace')
+            else:
+                result = _try_decode_bytes(decoded_bytes)
+            if result and '\ufffd' not in result:
+                return result
+        except Exception:
+            pass
+
+    # ---- 优先级2：从原始邮件字节中提取 filename ----
+    # 通过重新解析邮件原始数据来获取未解码的 filename
+    try:
+        # 尝试获取 part 的原始字节表示
+        raw_bytes = part.as_bytes()
+        # 在原始字节中搜索 Content-Disposition header
+        header_end = raw_bytes.find(b'\r\n\r\n')
+        if header_end > 0:
+            header_section = raw_bytes[:header_end]
+        else:
+            header_section = raw_bytes[:2048]  # 限制搜索范围
+
+        # 在原始字节中搜索 filename
         for pattern in [
-            rb'''filename\*\s*=\s*[A-Za-z0-9-]*'[^']*'([^;\s"']+)''',
-            rb'filename\s*=\s*"([^"]*)"',
-            rb'filename\s*=\s*([^;\s"][^;\s]*)',
+            rb'filename\*\s*=\s*([A-Za-z0-9_-]+)\'[^\']*\'([^\r\n;]+)',
+            rb'filename\s*=\s*"([^"]+)"',
+            rb"filename\s*=\s*([^\r\n;\s]+)",
         ]:
-            m = re.search(pattern, cd_raw, re.IGNORECASE)
+            m = re.search(pattern, header_section, re.IGNORECASE)
             if m:
-                result = _decode_name(m.group(1))
-                if result and '\ufffd' not in result:
-                    return result
-        # 尝试从Content-Type name提取
-        ct_raw = None
-        if hasattr(part, '_headers'):
-            for h_name, h_val in part._headers:
-                if h_name.lower() == 'content-type':
-                    ct_raw = h_val
-                    break
-        if isinstance(ct_raw, bytes):
-            m = re.search(rb'name\s*=\s*"([^"]*)"', ct_raw, re.IGNORECASE)
-            if m:
-                result = _decode_name(m.group(1))
-                if result and '\ufffd' not in result:
-                    return result
+                if b"'" in m.group(0) and m.lastindex >= 2:
+                    # RFC 2231 格式
+                    charset_bytes = m.group(1)
+                    value_bytes = m.group(2)
+                    try:
+                        charset = charset_bytes.decode('ascii')
+                        decoded_bytes = unquote(value_bytes.decode('ascii')).encode('latin-1')
+                        result = decoded_bytes.decode(charset, errors='replace')
+                        if '\ufffd' not in result:
+                            return result
+                    except Exception:
+                        pass
+                else:
+                    # 普通 filename="xxx" 或 filename=xxx
+                    raw_filename_bytes = m.group(1)
+                    # 去除可能的引号
+                    if raw_filename_bytes.startswith(b'"') and raw_filename_bytes.endswith(b'"'):
+                        raw_filename_bytes = raw_filename_bytes[1:-1]
+                    result = _try_decode_bytes(raw_filename_bytes)
+                    if result and '\ufffd' not in result:
+                        return result
 
-    # ---- 方法1：get_filename() ----
+        # 从 Content-Type 的 name 字段提取
+        for pattern in [
+            rb'name\*\s*=\s*([A-Za-z0-9_-]+)\'[^\']*\'([^\r\n;]+)',
+            rb'name\s*=\s*"([^"]+)"',
+            rb'name\s*=\s*([^\r\n;\s]+)',
+        ]:
+            m = re.search(pattern, header_section, re.IGNORECASE)
+            if m:
+                if b"'" in m.group(0) and m.lastindex >= 2:
+                    charset_bytes = m.group(1)
+                    value_bytes = m.group(2)
+                    try:
+                        charset = charset_bytes.decode('ascii')
+                        decoded_bytes = unquote(value_bytes.decode('ascii')).encode('latin-1')
+                        result = decoded_bytes.decode(charset, errors='replace')
+                        if '\ufffd' not in result:
+                            return result
+                    except Exception:
+                        pass
+                else:
+                    raw_name_bytes = m.group(1)
+                    if raw_name_bytes.startswith(b'"') and raw_name_bytes.endswith(b'"'):
+                        raw_name_bytes = raw_name_bytes[1:-1]
+                    result = _try_decode_bytes(raw_name_bytes)
+                    if result and '\ufffd' not in result:
+                        return result
+    except Exception:
+        pass  # 原始字节解析失败，继续回退方案
+
+    # ---- 优先级3：get_filename() ----
     filename = part.get_filename()
     if filename:
-        result = _decode_name(filename)
+        result = decode_str(filename)
         if result and '\ufffd' not in result:
             return result
+        # get_filename() 返回的 str 可能已被错误解码，尝试恢复
+        for recovery_enc in ['latin-1', 'cp1252', 'raw_unicode_escape']:
+            try:
+                raw_bytes = filename.encode(recovery_enc, errors='surrogateescape')
+                if any(b > 127 for b in raw_bytes):
+                    result = _try_decode_bytes(raw_bytes)
+                    if result and '\ufffd' not in result:
+                        return result
+            except Exception:
+                continue
 
-    # ---- 方法2：从cd_str手动解析 ----
+    # ---- 优先级4：从 cd_value / ct_value 手动解析 ----
     candidates = []
-    m = re.search(r"filename\*\s*=\s*([^;'\"]*'[^;'\"]*'[^;'\"]*)", cd_str, re.IGNORECASE)
+
+    # RFC 2047 编码的 filename（如 =?utf-8?B?...?=）
+    m = re.search(r'filename\s*=\s*=\?[^?]+\?[BQ]\?[^?]+\?=', cd_value, re.IGNORECASE)
     if m:
-        candidates.append(m.group(1).strip().strip('"'))
-    m = re.search(r'filename\s*=\s*"([^"]*)"', cd_str, re.IGNORECASE)
+        candidates.append(m.group(0).split('=', 1)[1].strip())
+
+    # 普通带引号的 filename
+    m = re.search(r'filename\s*=\s*"([^"]*)"', cd_value, re.IGNORECASE)
     if m:
         candidates.append(m.group(1))
-    m = re.search(r'filename\s*=\s*([^;"\s]+)', cd_str, re.IGNORECASE)
+
+    # 不带引号的 filename
+    m = re.search(r'filename\s*=\s*([^;"\s]+)', cd_value, re.IGNORECASE)
     if m and '"' not in m.group(0):
         candidates.append(m.group(1))
+
     # Content-Type name
-    ct_str = str(part.get('Content-Type', ''))
-    m = re.search(r'name\s*=\s*"([^"]*)"', ct_str, re.IGNORECASE)
+    m = re.search(r'name\s*=\s*"([^"]*)"', ct_value, re.IGNORECASE)
     if m:
+        candidates.append(m.group(1))
+    m = re.search(r'name\s*=\s*([^;\s"]+)', ct_value, re.IGNORECASE)
+    if m and '"' not in m.group(0):
         candidates.append(m.group(1))
 
     for c in candidates:
-        result = _decode_name(c)
+        result = decode_str(c)
         if result and '\ufffd' not in result:
             return result
+        # 尝试恢复
+        for recovery_enc in ['latin-1', 'cp1252', 'raw_unicode_escape']:
+            try:
+                raw_bytes = c.encode(recovery_enc, errors='surrogateescape')
+                if any(b > 127 for b in raw_bytes):
+                    result = _try_decode_bytes(raw_bytes)
+                    if result and '\ufffd' not in result:
+                        return result
+            except Exception:
+                continue
 
     # 兜底：返回第一个非空结果（即使有乱码）
     for c in candidates:
         if c:
-            return _decode_name(c)
+            return decode_str(c)
     return None
 
 
