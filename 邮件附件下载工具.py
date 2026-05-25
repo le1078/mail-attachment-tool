@@ -127,82 +127,123 @@ def clean_filename(name):
 
 def decode_attachment_filename(part):
     """
-    稳健解码附件文件名，支持多种编码方式：
-    - RFC 2231: charset'language'encoded → get_filename() 已处理
-    - RFC 2047: =?charset?B?...?= → decode_header 处理
-    - Content-Type name 参数（部分邮件客户端把文件名放这里）
-    - 原始 GBK/GB2312/GB18030/UTF-8 字节
+    万能附件文件名解码，攻关乱码问题：
+    1. 优先从 part._headers 获取原始header字节（绕过email模块的干扰）
+    2. 回退到 get_filename() / 手动解析Content-Disposition/Content-Type
     """
 
-    def _decode_raw(raw_name):
-        """解码原始文件名字符串，尝试多种编码"""
-        if not raw_name:
+    def _decode_name(raw):
+        """解码一个原始名称（str或bytes）"""
+        if isinstance(raw, bytes):
+            # 原始字节！直接用多种编码尝试
+            for enc in ['gb18030', 'gbk', 'gb2312', 'utf-8', 'big5', 'latin-1']:
+                try:
+                    trial = raw.decode(enc)
+                    if '\ufffd' not in trial:
+                        return trial
+                except Exception:
+                    continue
+            return raw.decode('utf-8', errors='replace')
+
+        if not raw or not isinstance(raw, str):
             return None
-        # 1. 先尝试 RFC 2047 解码
-        decoded = decode_str(raw_name)
+
+        # 先RFC 2047 decode
+        decoded = decode_str(raw)
         if '\ufffd' not in decoded:
             return decoded
 
-        # 2. 有乱码，尝试原始字节恢复
-        if isinstance(raw_name, str):
-            # 把 Python 内部表示转回原始字节
-            for enc in ['latin-1', 'utf-8']:
-                try:
-                    raw_bytes = raw_name.encode(enc, errors='surrogateescape')
-                    break
-                except (UnicodeEncodeError, UnicodeDecodeError):
-                    continue
-            else:
-                raw_bytes = raw_name.encode('utf-8', errors='replace')
-        else:
-            raw_bytes = raw_name
-
-        # 依次尝试常见中文编码
-        for enc in ['gb18030', 'gbk', 'gb2312', 'utf-8', 'big5', 'latin-1']:
+        # 有乱码，尝试把已损坏的Unicode转回原始字节
+        for recovery_enc in ['latin-1', 'cp1252', 'utf-8']:
             try:
-                trial = raw_bytes.decode(enc)
-                if '\ufffd' not in trial:
-                    return trial
+                bs = raw.encode(recovery_enc, errors='surrogateescape')
+                if any(b > 127 for b in bs):
+                    for enc in ['gb18030', 'gbk', 'gb2312', 'utf-8', 'big5']:
+                        try:
+                            trial = bs.decode(enc)
+                            if '\ufffd' not in trial:
+                                return trial
+                        except Exception:
+                            continue
             except Exception:
                 continue
         return decoded
 
-    # ---- 方法1：get_filename() 处理 RFC 2231 ----
+    # ---- 方法0：直接从 _headers 获取原始值 ----
+    if hasattr(part, '_headers'):
+        for h_name, h_val in part._headers:
+            if h_name.lower() == 'content-disposition':
+                cd_raw = h_val  # 可能是str/bytes/Header对象
+                break
+        else:
+            cd_raw = part.get('Content-Disposition', '')
+    else:
+        cd_raw = part.get('Content-Disposition', '')
+
+    # 从 Content-Disposition 头提取 filename 参数
+    # 支持: filename="...", filename=xxx, filename*=charset'lang'encoded
+    cd_str = str(cd_raw)
+
+    # 先尝试从原始值直接提取（可能保留更多原始字节信息）
+    if isinstance(cd_raw, bytes):
+        # 从原始字节中提取filename
+        for pattern in [
+            rb'''filename\*\s*=\s*[A-Za-z0-9-]*'[^']*'([^;\s"']+)''',
+            rb'filename\s*=\s*"([^"]*)"',
+            rb'filename\s*=\s*([^;\s"][^;\s]*)',
+        ]:
+            m = re.search(pattern, cd_raw, re.IGNORECASE)
+            if m:
+                result = _decode_name(m.group(1))
+                if result and '\ufffd' not in result:
+                    return result
+        # 尝试从Content-Type name提取
+        ct_raw = None
+        if hasattr(part, '_headers'):
+            for h_name, h_val in part._headers:
+                if h_name.lower() == 'content-type':
+                    ct_raw = h_val
+                    break
+        if isinstance(ct_raw, bytes):
+            m = re.search(rb'name\s*=\s*"([^"]*)"', ct_raw, re.IGNORECASE)
+            if m:
+                result = _decode_name(m.group(1))
+                if result and '\ufffd' not in result:
+                    return result
+
+    # ---- 方法1：get_filename() ----
     filename = part.get_filename()
     if filename:
-        return _decode_raw(filename)
-
-    # ---- 方法2：手动解析 Content-Disposition 和 Content-Type ----
-    cd = str(part.get("Content-Disposition", ""))
-    ct = str(part.get("Content-Type", ""))
-
-    # 收集所有候选文件名
-    candidates = []
-    # RFC 2231 扩展格式: filename*=charset'lang'encoded
-    m = re.search(r"filename\*\s*=\s*([^;'\"]*'[^;'\"]*'[^;'\"]*)", cd, re.IGNORECASE)
-    if m:
-        candidates.append(m.group(1).strip().strip('"'))
-    # 标准格式: filename="..."
-    m = re.search(r'filename\s*=\s*"([^"]*)"', cd, re.IGNORECASE)
-    if m:
-        candidates.append(m.group(1))
-    # 无引号格式: filename=xxx
-    m = re.search(r'filename\s*=\s*([^;"\s]+)', cd, re.IGNORECASE)
-    if m and '"' not in m.group(0):
-        candidates.append(m.group(1))
-    # Content-Type name (某些客户端)
-    m = re.search(r'name\s*=\s*"([^"]*)"', ct, re.IGNORECASE)
-    if m:
-        candidates.append(m.group(1))
-    m = re.search(r"name\*\s*=\s*([^;'\"]*'[^;'\"]*'[^;'\"]*)", ct, re.IGNORECASE)
-    if m:
-        candidates.append(m.group(1).strip().strip('"'))
-
-    for c in candidates:
-        result = _decode_raw(c)
-        if result:
+        result = _decode_name(filename)
+        if result and '\ufffd' not in result:
             return result
 
+    # ---- 方法2：从cd_str手动解析 ----
+    candidates = []
+    m = re.search(r"filename\*\s*=\s*([^;'\"]*'[^;'\"]*'[^;'\"]*)", cd_str, re.IGNORECASE)
+    if m:
+        candidates.append(m.group(1).strip().strip('"'))
+    m = re.search(r'filename\s*=\s*"([^"]*)"', cd_str, re.IGNORECASE)
+    if m:
+        candidates.append(m.group(1))
+    m = re.search(r'filename\s*=\s*([^;"\s]+)', cd_str, re.IGNORECASE)
+    if m and '"' not in m.group(0):
+        candidates.append(m.group(1))
+    # Content-Type name
+    ct_str = str(part.get('Content-Type', ''))
+    m = re.search(r'name\s*=\s*"([^"]*)"', ct_str, re.IGNORECASE)
+    if m:
+        candidates.append(m.group(1))
+
+    for c in candidates:
+        result = _decode_name(c)
+        if result and '\ufffd' not in result:
+            return result
+
+    # 兜底：返回第一个非空结果（即使有乱码）
+    for c in candidates:
+        if c:
+            return _decode_name(c)
     return None
 
 
@@ -247,11 +288,11 @@ def fetch_attachments(mail, sender_filter_list, save_folder, log_func,
     """
     mail.select("INBOX")
     # 搜索邮件：根据 read_status 使用不同 IMAP 搜索条件
+    # Coremail等部分服务器对SEEN搜索支持不好，改用UNSEEN+手动过滤
     if read_status == "unseen":
         search_criteria = "UNSEEN"
-    elif read_status == "seen":
-        search_criteria = "SEEN"
     else:
+        # "all" 或 "seen" → 获取全部邮件，再按需过滤
         search_criteria = "ALL"
     status, messages = mail.search(None, search_criteria)
     if status != "OK":
@@ -267,10 +308,11 @@ def fetch_attachments(mail, sender_filter_list, save_folder, log_func,
     download_count = 0
 
     # 只检查最近的邮件（避免每次都扫描全部）
-    # 读取已处理的邮件ID记录
+    # 只有"仅未读"模式才跳过已处理ID（避免遗漏已读变更/筛选条件变更的情况）
+    # "全部邮件"和"仅已读"模式每次都重新扫描所有邮件
     processed_file = Path(__file__).parent / "processed_ids.txt"
     processed_ids = set()
-    if processed_file.exists():
+    if read_status == "unseen" and processed_file.exists():
         with open(processed_file, "r", encoding="utf-8") as f:
             processed_ids = set(line.strip() for line in f)
 
@@ -278,8 +320,21 @@ def fetch_attachments(mail, sender_filter_list, save_folder, log_func,
     new_processed = set()
     for mail_id in reversed(mail_ids[-100:]):
         mail_id_str = mail_id.decode()
-        if mail_id_str in processed_ids:
+        if read_status == "unseen" and mail_id_str in processed_ids:
             continue
+
+        # 仅已读模式：手动检查邮件是否有 \Seen 标记
+        if read_status == "seen":
+            try:
+                flag_status, flag_data = mail.fetch(mail_id, "(FLAGS)")
+                if flag_status == "OK" and flag_data:
+                    flags = str(flag_data[0])
+                    if "\\Seen" not in flags:
+                        continue  # 未读，跳过
+                else:
+                    continue  # 获取FLAGS失败，保守跳过
+            except Exception:
+                continue  # 获取FLAGS异常，保守跳过
 
         status, msg_data = mail.fetch(mail_id, "(RFC822)")
         if status != "OK":
