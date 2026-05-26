@@ -967,10 +967,11 @@ def send_email(smtp_server, smtp_port, use_ssl, user, password, to_addr,
 
 
 def query_emails(mail, folder, search_criteria, max_count=50, log_func=None,
-                 start_date=None, end_date=None):
+                 start_date=None, end_date=None, read_filter="all"):
     """查询指定文件夹中的邮件列表，返回邮件摘要列表
     
     start_date/end_date: 日期字符串 "YYYY-MM-DD"，可筛选日期范围
+    read_filter: "all" = 全部, "seen" = 仅已读, "unseen" = 仅未读
     """
     # 智能选择文件夹：简单文件夹名不加引号，含空格/特殊字符才加
     if " " in folder or "/" in folder or any(ord(c) > 127 for c in folder):
@@ -988,8 +989,12 @@ def query_emails(mail, folder, search_criteria, max_count=50, log_func=None,
                 log_func(f"无法选择文件夹 {folder}: {e}")
             return []
 
-    # 构建完整 IMAP 搜索条件（含日期范围）
+    # 构建完整 IMAP 搜索条件（含日期范围和已读/未读筛选）
     parts = []
+    if read_filter == "seen":
+        parts.append("SEEN")
+    elif read_filter == "unseen":
+        parts.append("UNSEEN")
     if search_criteria and search_criteria != "ALL":
         parts.append(search_criteria)
     if start_date:
@@ -1026,98 +1031,114 @@ def query_emails(mail, folder, search_criteria, max_count=50, log_func=None,
 
     result = []
     for mail_id in reversed(mail_ids[-max_count:]):
-        status, msg_data = mail.fetch(mail_id, "(RFC822)")
+        status, msg_data = mail.fetch(mail_id, "(RFC822 FLAGS)")
         if status != "OK":
             continue
+        seen = False
+        raw_bytes = None
         for response_part in msg_data:
             if isinstance(response_part, tuple):
-                # IMAP FETCH 返回 (元数据, 邮件内容) 二元组，索引 1 才是真实邮件
                 raw_bytes = response_part[1]
-                msg = email.message_from_bytes(raw_bytes)
-                date_str = msg.get("Date", "")
-                try:
-                    dt = parsedate_to_datetime(date_str)
-                    date_formatted = dt.strftime("%Y-%m-%d %H:%M")
-                except Exception:
-                    date_formatted = date_str
-                result.append({
-                    "id": mail_id.decode(),
-                    "from": decode_str(msg.get("From", "")),
-                    "to": decode_str(msg.get("To", "")),
-                    "subject": decode_str(msg.get("Subject", "")),
-                    "date": date_formatted,
-                    "has_attachments": "attachment" in str(msg).lower(),
-                })
+            elif isinstance(response_part, bytes):
+                flags_str = response_part.decode('ascii', errors='replace')
+                if '\\Seen' in flags_str:
+                    seen = True
+        if raw_bytes is None:
+            continue
+        msg = email.message_from_bytes(raw_bytes)
+        date_str = msg.get("Date", "")
+        try:
+            dt = parsedate_to_datetime(date_str)
+            date_formatted = dt.strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            date_formatted = date_str
+        result.append({
+            "id": mail_id.decode(),
+            "from": decode_str(msg.get("From", "")),
+            "to": decode_str(msg.get("To", "")),
+            "subject": decode_str(msg.get("Subject", "")),
+            "date": date_formatted,
+            "has_attachments": "attachment" in str(msg).lower(),
+            "seen": seen,
+        })
     return result
 
 
 def fetch_email_detail(mail, mail_id, log_func=None):
     """获取单封邮件的详细信息"""
-    status, msg_data = mail.fetch(mail_id.encode(), "(RFC822)")
+    status, msg_data = mail.fetch(mail_id.encode(), "(RFC822 FLAGS)")
     if status != "OK":
         return None
+    seen = False
+    raw_email_bytes = None
     for response_part in msg_data:
         if isinstance(response_part, tuple):
             raw_email_bytes = response_part[1]
-            msg = email.message_from_bytes(raw_email_bytes)
-            detail = {
-                "from": decode_str(msg.get("From", "")),
-                "to": decode_str(msg.get("To", "")),
-                "cc": decode_str(msg.get("Cc", "")),
-                "subject": decode_str(msg.get("Subject", "")),
-                "date": msg.get("Date", ""),
-                "body": "",
-                "attachments": [],
-            }
+        elif isinstance(response_part, bytes):
+            flags_str = response_part.decode('ascii', errors='replace')
+            if '\\Seen' in flags_str:
+                seen = True
+    if raw_email_bytes is None:
+        return None
+    msg = email.message_from_bytes(raw_email_bytes)
+    detail = {
+        "from": decode_str(msg.get("From", "")),
+        "to": decode_str(msg.get("To", "")),
+        "cc": decode_str(msg.get("Cc", "")),
+        "subject": decode_str(msg.get("Subject", "")),
+        "date": msg.get("Date", ""),
+        "body": "",
+        "attachments": [],
+        "seen": seen,
+    }
 
-            raw_filenames = _get_attachment_filenames_from_raw(raw_email_bytes)
-            fn_iter = iter(raw_filenames)
+    raw_filenames = _get_attachment_filenames_from_raw(raw_email_bytes)
+    fn_iter = iter(raw_filenames)
 
-            if msg.is_multipart():
-                for part in msg.walk():
-                    content_type = part.get_content_type()
-                    content_disposition = str(part.get("Content-Disposition", ""))
-                    if "attachment" in content_disposition:
-                        try:
-                            filename = next(fn_iter)
-                        except StopIteration:
-                            filename = decode_attachment_filename(part)
-                        if filename:
-                            detail["attachments"].append({
-                                "filename": filename,
-                                "size": len(part.get_payload(decode=True) or b""),
-                                "payload": part.get_payload(decode=True),
-                            })
-                    elif content_type == "text/plain" and "attachment" not in content_disposition:
-                        try:
-                            payload = part.get_payload(decode=True)
-                            if payload:
-                                detail["body"] = _try_decode_bytes(payload)[:5000]
-                        except Exception:
-                            pass
-            else:
-                content_type = msg.get_content_type()
-                content_disposition = str(msg.get("Content-Disposition", ""))
-                if "attachment" in content_disposition:
-                    try:
-                        filename = next(fn_iter)
-                    except StopIteration:
-                        filename = decode_attachment_filename(msg)
-                    if filename:
-                        detail["attachments"].append({
-                            "filename": filename,
-                            "size": len(msg.get_payload(decode=True) or b""),
-                            "payload": msg.get_payload(decode=True),
-                        })
-                elif content_type == "text/plain":
-                    try:
-                        payload = msg.get_payload(decode=True)
-                        if payload:
-                            detail["body"] = _try_decode_bytes(payload)[:5000]
-                    except Exception:
-                        pass
-            return detail
-    return None
+    if msg.is_multipart():
+        for part in msg.walk():
+            content_type = part.get_content_type()
+            content_disposition = str(part.get("Content-Disposition", ""))
+            if "attachment" in content_disposition:
+                try:
+                    filename = next(fn_iter)
+                except StopIteration:
+                    filename = decode_attachment_filename(part)
+                if filename:
+                    detail["attachments"].append({
+                        "filename": filename,
+                        "size": len(part.get_payload(decode=True) or b""),
+                        "payload": part.get_payload(decode=True),
+                    })
+            elif content_type == "text/plain" and "attachment" not in content_disposition:
+                try:
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        detail["body"] = _try_decode_bytes(payload)[:5000]
+                except Exception:
+                    pass
+    else:
+        content_type = msg.get_content_type()
+        content_disposition = str(msg.get("Content-Disposition", ""))
+        if "attachment" in content_disposition:
+            try:
+                filename = next(fn_iter)
+            except StopIteration:
+                filename = decode_attachment_filename(msg)
+            if filename:
+                detail["attachments"].append({
+                    "filename": filename,
+                    "size": len(msg.get_payload(decode=True) or b""),
+                    "payload": msg.get_payload(decode=True),
+                })
+        elif content_type == "text/plain":
+            try:
+                payload = msg.get_payload(decode=True)
+                if payload:
+                    detail["body"] = _try_decode_bytes(payload)[:5000]
+            except Exception:
+                pass
+    return detail
 
 
 # ==================== GUI ====================
@@ -1499,6 +1520,12 @@ class MailAttachmentTool:
         self.entry_query_keyword = ttk.Entry(query_ctrl1, width=20)
         self.entry_query_keyword.pack(side=tk.LEFT, padx=3)
 
+        ttk.Label(query_ctrl1, text="已读/未读:").pack(side=tk.LEFT, padx=(10, 0))
+        self.combo_read_filter = ttk.Combobox(query_ctrl1, width=6, state="readonly",
+                                              values=["全部", "已读", "未读"])
+        self.combo_read_filter.pack(side=tk.LEFT, padx=3)
+        self.combo_read_filter.set("全部")
+
         self.btn_query_mail = ttk.Button(query_ctrl1, text="查询", command=self._do_mail_query, width=8)
         self.btn_query_mail.pack(side=tk.LEFT, padx=3)
         self.btn_refresh_mail = ttk.Button(query_ctrl1, text="刷新列表", command=self._do_mail_query, width=8)
@@ -1530,15 +1557,18 @@ class MailAttachmentTool:
         list_frame = ttk.Frame(query_paned)
         query_paned.add(list_frame, weight=3)
 
-        columns = ("发件人/收件人", "主题", "日期")
+        columns = ("状态", "发件人/收件人", "主题", "日期")
         self.mail_tree = ttk.Treeview(list_frame, columns=columns, show="headings",
                                        selectmode="browse", height=15)
+        self.mail_tree.heading("状态", text="状态")
         self.mail_tree.heading("发件人/收件人", text="发件人/收件人")
         self.mail_tree.heading("主题", text="主题")
         self.mail_tree.heading("日期", text="日期")
-        self.mail_tree.column("发件人/收件人", width=160)
-        self.mail_tree.column("主题", width=200)
+        self.mail_tree.column("状态", width=48, anchor=tk.CENTER)
+        self.mail_tree.column("发件人/收件人", width=150)
+        self.mail_tree.column("主题", width=190)
         self.mail_tree.column("日期", width=110)
+        self.mail_tree.tag_configure("unseen", font=("", 9, "bold"))
         self.mail_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         tree_scroll = ttk.Scrollbar(list_frame, command=self.mail_tree.yview)
         tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
@@ -2164,6 +2194,9 @@ class MailAttachmentTool:
         start_date = self.entry_query_start_date.get().strip() or None
         end_date = self.entry_query_end_date.get().strip() or None
 
+        read_filter_map = {"全部": "all", "已读": "seen", "未读": "unseen"}
+        read_filter = read_filter_map.get(self.combo_read_filter.get(), "all")
+
         # 标记查询中，禁用按钮
         self.querying = True
         self.btn_query_mail.config(state=tk.DISABLED, text="查询中...")
@@ -2203,7 +2236,8 @@ class MailAttachmentTool:
                 emails = query_emails(mail, actual_folder, criteria, max_count=max_count,
                                      log_func=lambda msg: self.root.after(0, lambda: self.log(msg, "query")),
                                      start_date=start_date,
-                                     end_date=end_date)
+                                     end_date=end_date,
+                                     read_filter=read_filter)
                 mail.logout()
 
                 # 关键词本地过滤
@@ -2232,7 +2266,10 @@ class MailAttachmentTool:
         # 填充列表（已在 _do_mail_query 中清空）
         for em in emails:
             person = em["from"] if folder != "已发送" else em["to"]
-            self.mail_tree.insert("", tk.END, values=(person, em["subject"], em["date"]), iid=em["id"])
+            status_text = "未读" if not em.get("seen") else "已读"
+            tags = ("unseen",) if not em.get("seen") else ()
+            self.mail_tree.insert("", tk.END, values=(status_text, person, em["subject"], em["date"]),
+                                  iid=em["id"], tags=tags)
 
         self.log(f"查询完成，共 {len(emails)} 封邮件", "query")
         self.log("=" * 50, "query")
@@ -2315,6 +2352,8 @@ class MailAttachmentTool:
                 text += f"抄送: {detail['cc']}\n"
             text += f"主题: {detail['subject']}\n"
             text += f"日期: {detail['date']}\n"
+            seen_text = "已读" if detail.get('seen') else "未读"
+            text += f"状态: {seen_text}\n"
             text += f"{'─' * 40}\n"
             if detail.get('body'):
                 text += detail['body']
