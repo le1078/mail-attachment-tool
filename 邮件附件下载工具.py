@@ -931,6 +931,7 @@ class MailAttachmentTool:
         self.log_filter = "all"
         self.last_error_time = {}  # 错误去重: {error_key: timestamp}
         self.retry_state = {}  # 重试状态: {task_type: {"fail_count": N, "last_fail": ts}}
+        self.querying = False  # 邮件查询防重入标志
 
         self._build_ui()
         self._start_clock_update()
@@ -1289,8 +1290,10 @@ class MailAttachmentTool:
         self.entry_query_keyword = ttk.Entry(query_ctrl1, width=20)
         self.entry_query_keyword.pack(side=tk.LEFT, padx=3)
 
-        ttk.Button(query_ctrl1, text="查询", command=self._do_mail_query, width=8).pack(side=tk.LEFT, padx=3)
-        ttk.Button(query_ctrl1, text="刷新列表", command=self._do_mail_query, width=8).pack(side=tk.LEFT, padx=3)
+        self.btn_query_mail = ttk.Button(query_ctrl1, text="查询", command=self._do_mail_query, width=8)
+        self.btn_query_mail.pack(side=tk.LEFT, padx=3)
+        self.btn_refresh_mail = ttk.Button(query_ctrl1, text="刷新列表", command=self._do_mail_query, width=8)
+        self.btn_refresh_mail.pack(side=tk.LEFT, padx=3)
 
         # 查询控制栏 — 第二行：日期范围 + 数量
         query_ctrl2 = ttk.Frame(tab_query)
@@ -1580,7 +1583,7 @@ class MailAttachmentTool:
 
             cfg = {
                 "imap_server": self.entry_server.get().strip(),
-                "imap_port": int(self.entry_port.get().strip()),
+                "imap_port": int(self.entry_port.get().strip() or "993"),
                 "email_user": self.entry_user.get().strip(),
                 "email_pass": self.entry_pass.get().strip(),
                 "sender_filter": "",
@@ -1606,7 +1609,7 @@ class MailAttachmentTool:
                 "download_filter_date_start": self.entry_dl_email_date1.get().strip(),
                 "download_filter_date_end": self.entry_dl_email_date2.get().strip(),
                 "smtp_server": self.entry_smtp_server.get().strip(),
-                "smtp_port": int(self.entry_smtp_port.get().strip()),
+                "smtp_port": int(self.entry_smtp_port.get().strip() or "465"),
                 "smtp_ssl": self.var_smtp_ssl.get(),
                 "skip_ssl_smtp": self.var_skip_ssl_smtp.get(),
                 "send_user": self.entry_send_user.get().strip(),
@@ -1637,8 +1640,8 @@ class MailAttachmentTool:
             save_config(cfg)
             self.config = cfg
             self.log("配置已保存")
-        except ValueError:
-            messagebox.showerror("错误", "端口/时间必须是数字")
+        except ValueError as e:
+            messagebox.showerror("错误", f"端口/时间必须是数字\n{str(e)}")
 
     def _save_download_config(self):
         dl_days = [i + 1 for i, var in enumerate(self.day_vars) if var.get()]
@@ -1936,7 +1939,10 @@ class MailAttachmentTool:
 
     # ---------- 邮件查询 (功能3) ----------
     def _do_mail_query(self):
-        """执行邮件查询"""
+        """执行邮件查询（后台线程，不阻塞 UI）"""
+        if self.querying:
+            return  # 防止重复点击
+
         self._save_download_config()
         cfg = self.config
         if not cfg["email_user"] or not cfg["email_pass"]:
@@ -1946,60 +1952,98 @@ class MailAttachmentTool:
         keyword = self.entry_query_keyword.get().strip()
         max_count = int(self.spin_query_count.get())
         folder = self.combo_query_folder.get()
+        start_date = self.entry_query_start_date.get().strip() or None
+        end_date = self.entry_query_end_date.get().strip() or None
+
+        # 标记查询中，禁用按钮
+        self.querying = True
+        self.btn_query_mail.config(state=tk.DISABLED, text="查询中...")
+        self.btn_refresh_mail.config(state=tk.DISABLED, text="查询中...")
+
+        # 清除旧列表，显示加载提示
+        for item in self.mail_tree.get_children():
+            self.mail_tree.delete(item)
+        self.query_detail_data = None
+        self.mail_detail_text.config(state=tk.NORMAL)
+        self.mail_detail_text.delete(1.0, tk.END)
+        self.mail_detail_text.insert(tk.END, "正在查询邮件，请稍候...")
+        self.mail_detail_text.config(state=tk.DISABLED)
 
         self.log(f"正在查询 {folder}...", "query")
 
-        try:
-            mail = connect_imap(cfg["imap_server"], cfg["imap_port"],
-                                cfg["email_user"], cfg["email_pass"],
-                                cfg.get("skip_ssl_verify", False))
+        # 在后台线程执行 IMAP 操作
+        def _query_worker():
+            try:
+                mail = connect_imap(cfg["imap_server"], cfg["imap_port"],
+                                    cfg["email_user"], cfg["email_pass"],
+                                    cfg.get("skip_ssl_verify", False))
 
-            # 关键词不再走 IMAP 搜索（OR 运算符国产邮箱兼容性差），
-            # 改为 Python 侧过滤，IMAP 仅负责日期范围
-            criteria = "ALL"
+                criteria = "ALL"
 
-            if folder == "已发送":
-                # 自动检测已发送文件夹名
-                sent_folder = get_sent_folder_name(mail, log_func=lambda msg: self.log(msg, "query"))
-                if sent_folder:
-                    folder = sent_folder
-                    self.log(f"检测到已发送文件夹: {sent_folder}", "query")
-                else:
-                    self.log("未找到已发送文件夹", "query")
-                    mail.logout()
-                    messagebox.showwarning("提示", "未找到已发送文件夹")
-                    return
+                actual_folder = folder
+                if folder == "已发送":
+                    sent_folder = get_sent_folder_name(mail, log_func=lambda msg: self.root.after(0, lambda: self.log(msg, "query")))
+                    if sent_folder:
+                        actual_folder = sent_folder
+                        self.root.after(0, lambda: self.log(f"检测到已发送文件夹: {sent_folder}", "query"))
+                    else:
+                        mail.logout()
+                        self.root.after(0, lambda: self._query_failed("未找到已发送文件夹"))
+                        return
 
-            emails = query_emails(mail, folder, criteria, max_count=max_count,
-                                 log_func=lambda msg: self.log(msg, "query"),
-                                 start_date=self.entry_query_start_date.get().strip() or None,
-                                 end_date=self.entry_query_end_date.get().strip() or None)
-            mail.logout()
+                emails = query_emails(mail, actual_folder, criteria, max_count=max_count,
+                                     log_func=lambda msg: self.root.after(0, lambda: self.log(msg, "query")),
+                                     start_date=start_date,
+                                     end_date=end_date)
+                mail.logout()
 
-            # 关键词本地过滤（IMAP OR 语法国产邮箱兼容性差，中文编码也有问题）
-            if keyword:
-                kw = keyword.lower()
-                emails = [e for e in emails if kw in (e.get("subject") or "").lower() or kw in (e.get("from") or "").lower()]
+                # 关键词本地过滤
+                if keyword:
+                    kw = keyword.lower()
+                    emails = [e for e in emails if kw in (e.get("subject") or "").lower() or kw in (e.get("from") or "").lower()]
 
-            # 清除旧列表
-            for item in self.mail_tree.get_children():
-                self.mail_tree.delete(item)
+                # 回到主线程更新 UI
+                self.root.after(0, lambda: self._query_success(emails, folder))
+            except Exception as e:
+                self.root.after(0, lambda: self._query_failed(str(e)))
 
-            self.query_detail_data = None
-            self.mail_detail_text.config(state=tk.NORMAL)
-            self.mail_detail_text.delete(1.0, tk.END)
-            self.mail_detail_text.config(state=tk.DISABLED)
+        threading.Thread(target=_query_worker, daemon=True).start()
 
-            for em in emails:
-                person = em["from"] if folder != "已发送" else em["to"]
-                self.mail_tree.insert("", tk.END, values=(person, em["subject"], em["date"]), iid=em["id"])
+    def _query_success(self, emails, folder):
+        """主线程：显示查询结果"""
+        self.querying = False
+        self.btn_query_mail.config(state=tk.NORMAL, text="查询")
+        self.btn_refresh_mail.config(state=tk.NORMAL, text="刷新列表")
 
-            self.log(f"查询完成，共 {len(emails)} 封邮件", "query")
-        except Exception as e:
-            self.log(f"查询失败: {e}", "query")
-            messagebox.showerror("查询失败", str(e))
+        # 清除旧详情
+        self.mail_detail_text.config(state=tk.NORMAL)
+        self.mail_detail_text.delete(1.0, tk.END)
+        self.mail_detail_text.config(state=tk.DISABLED)
 
+        # 填充列表（已在 _do_mail_query 中清空）
+        for em in emails:
+            person = em["from"] if folder != "已发送" else em["to"]
+            self.mail_tree.insert("", tk.END, values=(person, em["subject"], em["date"]), iid=em["id"])
+
+        self.log(f"查询完成，共 {len(emails)} 封邮件", "query")
         self.log("=" * 50, "query")
+
+    def _query_failed(self, error_msg):
+        """主线程：查询失败处理"""
+        self.querying = False
+        self.btn_query_mail.config(state=tk.NORMAL, text="查询")
+        self.btn_refresh_mail.config(state=tk.NORMAL, text="刷新列表")
+
+        self.mail_detail_text.config(state=tk.NORMAL)
+        self.mail_detail_text.delete(1.0, tk.END)
+        self.mail_detail_text.insert(tk.END, f"查询失败:\n{error_msg}")
+        self.mail_detail_text.config(state=tk.DISABLED)
+
+        self.log(f"查询失败: {error_msg}", "query")
+        self.log("=" * 50, "query")
+
+        if "未找到已发送文件夹" not in error_msg:
+            messagebox.showerror("查询失败", error_msg)
 
     def _on_mail_select(self, event):
         """选中邮件时显示详情"""
@@ -2013,10 +2057,11 @@ class MailAttachmentTool:
         self.mail_detail_text.insert(tk.END, "正在加载邮件详情...")
         self.mail_detail_text.config(state=tk.DISABLED)
 
-        # 后台线程获取详情
-        threading.Thread(target=self._fetch_mail_detail_thread, args=(mail_id,), daemon=True).start()
+        # 后台线程获取详情（在生成线程前捕获 folder，避免线程内调用 Tkinter）
+        folder = self.combo_query_folder.get()
+        threading.Thread(target=self._fetch_mail_detail_thread, args=(mail_id, folder), daemon=True).start()
 
-    def _fetch_mail_detail_thread(self, mail_id):
+    def _fetch_mail_detail_thread(self, mail_id, query_folder):
         """后台线程获取邮件详情"""
         cfg = self.config
         try:
@@ -2024,8 +2069,8 @@ class MailAttachmentTool:
                                 cfg["email_user"], cfg["email_pass"],
                                 cfg.get("skip_ssl_verify", False))
 
-            # 获取当前查询选中的文件夹
-            folder = self.combo_query_folder.get()
+            # 获取当前查询选中的文件夹（由调用方传入，避免线程内调用 Tkinter）
+            folder = query_folder
             if folder == "已发送":
                 sent_folder = get_sent_folder_name(mail)
                 folder = sent_folder or "INBOX"
