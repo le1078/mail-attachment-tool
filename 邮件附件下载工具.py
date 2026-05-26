@@ -244,6 +244,188 @@ def _parse_rfc2231_value(raw_value):
     return _try_decode_bytes(decoded_bytes) or None
 
 
+def _get_attachment_filenames_from_raw(raw_bytes):
+    """
+    用 email.policy.default 重解析原始邮件字节，提取所有 attachment 的正确文件名。
+    default 策略原生支持 RFC 2231 解码。对于任何包含替换字符(\ufffd)的失败解码
+    或 default 完全无法处理的边缘情况，回退到原始字节多编码扫描。
+    """
+    try:
+        msg_default = email.message_from_bytes(raw_bytes, policy=email.policy.default)
+    except Exception:
+        msg_default = None
+
+    filenames = []
+    has_bad_filename = False
+    if msg_default is not None:
+        for dp in msg_default.walk():
+            cd = str(dp.get("Content-Disposition", ""))
+            if "attachment" not in cd.lower():
+                continue
+            fn = dp.get_filename()
+            if fn:
+                if '=?' in fn and '?=' in fn:
+                    result = decode_str(fn)
+                    if result:
+                        filenames.append(result)
+                        continue
+                if '\ufffd' in fn:
+                    has_bad_filename = True
+                    continue
+                filenames.append(fn)
+
+    if has_bad_filename or not filenames:
+        raw_filenames = _scan_raw_for_attachment_filenames(raw_bytes)
+        if has_bad_filename:
+            return raw_filenames
+        return raw_filenames
+
+    return filenames
+
+
+def _find_boundary_from_raw(raw_bytes):
+    header_end = raw_bytes.find(b'\r\n\r\n')
+    if header_end == -1:
+        header_end = raw_bytes.find(b'\n\n')
+    if header_end == -1:
+        return None
+    header = raw_bytes[:header_end]
+    m = re.search(rb'boundary\s*=\s*"([^"]+)"', header, re.IGNORECASE)
+    if not m:
+        m = re.search(rb'boundary\s*=\s*([^\s;\r\n]+)', header, re.IGNORECASE)
+    return m.group(1) if m else None
+
+
+def _decode_filename_from_header_bytes(header_bytes):
+    rfc2231_single = re.search(rb'filename\s*\*\s*=\s*([a-zA-Z0-9_-]+)\'[^\']*\'([^\r\n;]+)', header_bytes, re.IGNORECASE)
+    if rfc2231_single:
+        charset = rfc2231_single.group(1).decode('ascii', errors='replace').strip()
+        encoded_part = rfc2231_single.group(2).decode('ascii', errors='replace').strip()
+        try:
+            decoded_str = unquote(encoded_part, encoding=charset, errors='replace')
+            if '\ufffd' not in decoded_str:
+                return decoded_str
+        except Exception:
+            pass
+
+    rfc2231_multi = {}
+    for m in re.finditer(rb'filename\s*\*\s*(\d+)\s*\*\s*=\s*([^\r\n;]+)', header_bytes, re.IGNORECASE):
+        seg_idx = int(m.group(1))
+        seg_val = m.group(2).decode('ascii', errors='replace').strip()
+        rfc2231_multi[seg_idx] = seg_val
+    if rfc2231_multi:
+        sorted_indices = sorted(rfc2231_multi.keys())
+        first_val = rfc2231_multi[sorted_indices[0]]
+        m_charset = re.match(r'([a-zA-Z0-9_-]+)\'[^\']*\'(.+)', first_val, re.DOTALL)
+        charset = None
+        if m_charset:
+            charset = m_charset.group(1)
+            rfc2231_multi[sorted_indices[0]] = m_charset.group(2)
+        combined = ''.join([rfc2231_multi[i] for i in sorted_indices if i in rfc2231_multi])
+        try:
+            if charset:
+                decoded_str = unquote(combined, encoding=charset, errors='replace')
+            else:
+                decoded_str = _try_decode_bytes(unquote(combined, errors='replace').encode('latin-1'))
+            if decoded_str and '\ufffd' not in decoded_str:
+                return decoded_str
+        except Exception:
+            pass
+
+    for tag in [b'filename', b'name']:
+        m = re.search(tag + rb'\s*=\s*"([^"]+)"', header_bytes, re.IGNORECASE)
+        if not m:
+            m = re.search(tag + rb'\s*=\s*=?([^\r\n;\s]+)', header_bytes, re.IGNORECASE)
+        if m:
+            raw_filename_bytes = m.group(1)
+            try:
+                candidate_str = raw_filename_bytes.decode('ascii', errors='strict')
+                for try_str in [candidate_str, '=?' + candidate_str]:
+                    if '=?' in try_str and '?=' in try_str and ('?B?' in try_str or '?Q?' in try_str):
+                        decoded_parts = decode_header(try_str)
+                        result_parts = []
+                        for p, cs in decoded_parts:
+                            if isinstance(p, bytes):
+                                result_parts.append(p.decode(cs or 'utf-8', errors='replace'))
+                            else:
+                                result_parts.append(str(p))
+                        joined = ''.join(result_parts)
+                        if joined and '\ufffd' not in joined and joined != try_str:
+                            return joined
+                    if candidate_str.startswith('?') and '?' in candidate_str[1:]:
+                        rfc2047_candidate = '=' + candidate_str
+                        if '=?' in rfc2047_candidate and '?=' in rfc2047_candidate and ('?B?' in rfc2047_candidate or '?Q?' in rfc2047_candidate):
+                            decoded_parts = decode_header(rfc2047_candidate)
+                            result_parts = []
+                            for p, cs in decoded_parts:
+                                if isinstance(p, bytes):
+                                    result_parts.append(p.decode(cs or 'utf-8', errors='replace'))
+                                else:
+                                    result_parts.append(str(p))
+                            joined = ''.join(result_parts)
+                            if joined and '\ufffd' not in joined and joined != rfc2047_candidate:
+                                return joined
+            except Exception:
+                pass
+            result = _try_decode_bytes(raw_filename_bytes)
+            if result and '\ufffd' not in result:
+                return result
+            try:
+                if b'%' in raw_filename_bytes:
+                    unquoted = unquote_to_bytes(raw_filename_bytes)
+                    result2 = _try_decode_bytes(unquoted)
+                    if result2 and '\ufffd' not in result2:
+                        return result2
+            except Exception:
+                pass
+            return result
+
+    return None
+
+
+def _scan_raw_for_attachment_filenames(raw_bytes):
+    boundary = _find_boundary_from_raw(raw_bytes)
+    if not boundary:
+        cd_match = re.search(rb'Content-Disposition:\s*([^\r\n]+)', raw_bytes[:4096], re.IGNORECASE)
+        if cd_match:
+            cd_str = cd_match.group(1).decode('ascii', errors='replace')
+            if 'attachment' in cd_str.lower():
+                filename = _decode_filename_from_header_bytes(raw_bytes[:4096])
+                if filename:
+                    return [filename]
+        return []
+
+    boundary_marker = b'--' + boundary
+    parts = raw_bytes.split(boundary_marker)
+
+    filenames = []
+    for part_bytes in parts[1:]:
+        if part_bytes.startswith(b'--'):
+            break
+
+        part_bytes = part_bytes.lstrip(b'\r\n')
+        sep = part_bytes.find(b'\r\n\r\n')
+        if sep == -1:
+            sep = part_bytes.find(b'\n\n')
+        if sep == -1:
+            continue
+        part_headers = part_bytes[:sep]
+
+        cd_match = re.search(rb'Content-Disposition:\s*([^\r\n]+)', part_headers, re.IGNORECASE)
+        if not cd_match:
+            continue
+        cd_value = cd_match.group(1)
+        cd_str = cd_value.decode('ascii', errors='replace')
+        if 'attachment' not in cd_str.lower():
+            continue
+
+        filename = _decode_filename_from_header_bytes(part_headers)
+        if filename:
+            filenames.append(filename)
+
+    return filenames
+
+
 def decode_attachment_filename(part):
     """万能附件文件名解码"""
     cd_value = ""
@@ -355,7 +537,14 @@ def decode_attachment_filename(part):
         result = decode_str(filename)
         if result and '\ufffd' not in result:
             return result
-        for recovery_enc in ['latin-1', 'cp1252', 'raw_unicode_escape']:
+        if isinstance(filename, str) and '%' in filename:
+            try:
+                decoded = unquote(filename, encoding='utf-8', errors='replace')
+                if decoded and '\ufffd' not in decoded and decoded != filename:
+                    return decoded
+            except Exception:
+                pass
+        for recovery_enc in ['latin-1', 'cp1252']:
             try:
                 raw_bytes = filename.encode(recovery_enc, errors='surrogateescape')
                 if any(b > 127 for b in raw_bytes):
@@ -385,7 +574,7 @@ def decode_attachment_filename(part):
         result = decode_str(c)
         if result and '\ufffd' not in result:
             return result
-        for recovery_enc in ['latin-1', 'cp1252', 'raw_unicode_escape']:
+        for recovery_enc in ['latin-1', 'cp1252']:
             try:
                 raw_bytes = c.encode(recovery_enc, errors='surrogateescape')
                 if any(b > 127 for b in raw_bytes):
@@ -608,7 +797,8 @@ def fetch_attachments(mail, sender_filter_list, save_folder, log_func,
 
         for response_part in msg_data:
             if isinstance(response_part, tuple):
-                msg = email.message_from_bytes(response_part[1])
+                raw_email_bytes = response_part[1]  # 整个邮件的原始IMAP字节
+                msg = email.message_from_bytes(raw_email_bytes)
                 from_ = decode_str(msg.get("From", ""))
                 subject = decode_str(msg.get("Subject", ""))
                 from_lower = from_.lower()
@@ -650,11 +840,17 @@ def fetch_attachments(mail, sender_filter_list, save_folder, log_func,
 
                 log_func(f"  匹配发件人: {from_} | 主题: {subject}")
 
+                raw_filenames = _get_attachment_filenames_from_raw(raw_email_bytes)
+                fn_iter = iter(raw_filenames)
+
                 if msg.is_multipart():
                     for part in msg.walk():
                         content_disposition = str(part.get("Content-Disposition", ""))
                         if "attachment" in content_disposition:
-                            filename = decode_attachment_filename(part)
+                            try:
+                                filename = next(fn_iter)
+                            except StopIteration:
+                                filename = decode_attachment_filename(part)
                             if not filename:
                                 log_func(f"   ⚠ 附件解码失败")
                                 continue
@@ -671,7 +867,10 @@ def fetch_attachments(mail, sender_filter_list, save_folder, log_func,
                 else:
                     content_disposition = str(msg.get("Content-Disposition", ""))
                     if "attachment" in content_disposition:
-                        filename = decode_attachment_filename(msg)
+                        try:
+                            filename = next(fn_iter)
+                        except StopIteration:
+                            filename = decode_attachment_filename(msg)
                         if not filename:
                             log_func(f"   ⚠ 附件解码失败")
                             continue
@@ -859,7 +1058,8 @@ def fetch_email_detail(mail, mail_id, log_func=None):
         return None
     for response_part in msg_data:
         if isinstance(response_part, tuple):
-            msg = email.message_from_bytes(response_part[1])
+            raw_email_bytes = response_part[1]
+            msg = email.message_from_bytes(raw_email_bytes)
             detail = {
                 "from": decode_str(msg.get("From", "")),
                 "to": decode_str(msg.get("To", "")),
@@ -869,13 +1069,19 @@ def fetch_email_detail(mail, mail_id, log_func=None):
                 "body": "",
                 "attachments": [],
             }
-            # 提取正文和附件
+
+            raw_filenames = _get_attachment_filenames_from_raw(raw_email_bytes)
+            fn_iter = iter(raw_filenames)
+
             if msg.is_multipart():
                 for part in msg.walk():
                     content_type = part.get_content_type()
                     content_disposition = str(part.get("Content-Disposition", ""))
                     if "attachment" in content_disposition:
-                        filename = decode_attachment_filename(part)
+                        try:
+                            filename = next(fn_iter)
+                        except StopIteration:
+                            filename = decode_attachment_filename(part)
                         if filename:
                             detail["attachments"].append({
                                 "filename": filename,
@@ -893,7 +1099,10 @@ def fetch_email_detail(mail, mail_id, log_func=None):
                 content_type = msg.get_content_type()
                 content_disposition = str(msg.get("Content-Disposition", ""))
                 if "attachment" in content_disposition:
-                    filename = decode_attachment_filename(msg)
+                    try:
+                        filename = next(fn_iter)
+                    except StopIteration:
+                        filename = decode_attachment_filename(msg)
                     if filename:
                         detail["attachments"].append({
                             "filename": filename,
