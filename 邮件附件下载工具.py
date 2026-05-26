@@ -2,6 +2,8 @@
 邮件附件自动下载 & 定时发送工具
 - 定时下载指定发件人的邮件附件
 - 定时发送邮件（带附件）给指定收件人
+- 邮件查询（收件箱/已发送）
+- 失败告警、重试、日志持久化
 """
 import imaplib
 import smtplib
@@ -13,6 +15,8 @@ import ssl
 import threading
 import time
 import datetime
+import traceback
+import glob as glob_mod
 from email.header import decode_header
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -31,15 +35,20 @@ from PIL import Image, ImageDraw
 
 # ==================== 配置管理 ====================
 CONFIG_FILE = Path(__file__).parent / "config.json"
+CONFIG_BACKUP_DIR = Path(__file__).parent / "config_backups"
+LOG_PERSIST_FILE = Path(__file__).parent / "mail_tool_log.txt"
+MAX_LOG_LINES = 10000
+MAX_CONFIG_BACKUPS = 5
+
 DEFAULT_CONFIG = {
     # === 下载配置 ===
     "imap_server": "",
     "imap_port": 993,
     "email_user": "",
     "email_pass": "",
-    "sender_filter_list": [],    # 发件人筛选列表，一行一个
-    "download_keyword_filter": "",  # 邮件主题关键词筛选
-    "download_read_status": "all",  # 已读/未读筛选: all / unseen / seen
+    "sender_filter_list": [],
+    "download_keyword_filter": "",
+    "download_read_status": "all",
     "save_folder": "",
     "skip_ssl_verify": False,
     "schedule_download": {
@@ -49,15 +58,13 @@ DEFAULT_CONFIG = {
         "second": 0,
         "enabled": False
     },
-    # === 邮件下载时间段过滤（可选） ===
-    "download_filter_days": [],           # 仅下载这些星期几的邮件，空=不限
-    "download_filter_time_enabled": False, # 启用时间段过滤
-    "download_filter_time_start": "00:00", # 起始时间
-    "download_filter_time_end": "23:59",   # 截止时间
-    # === 邮件下载日期范围过滤（可选） ===
-    "download_filter_date_enabled": False,  # 启用日期范围过滤
-    "download_filter_date_start": "",       # 起始日期 YYYY-MM-DD
-    "download_filter_date_end": "",         # 截止日期 YYYY-MM-DD
+    "download_filter_days": [],
+    "download_filter_time_enabled": False,
+    "download_filter_time_start": "00:00",
+    "download_filter_time_end": "23:59",
+    "download_filter_date_enabled": False,
+    "download_filter_date_start": "",
+    "download_filter_date_end": "",
     # === 发送配置 ===
     "smtp_server": "",
     "smtp_port": 465,
@@ -68,9 +75,9 @@ DEFAULT_CONFIG = {
     "send_to": "",
     "send_subject": "",
     "send_body": "",
-    "send_attachment_mode": "single",  # single / multi / folder
-    "send_attachment_list": [],         # 多文件或文件夹模式下的路径列表
-    "send_attachment": "",             # 单文件模式（兼容旧配置）
+    "send_attachment_mode": "single",
+    "send_attachment_list": [],
+    "send_attachment": "",
     "schedule_send": {
         "days": [],
         "hour": 8,
@@ -85,6 +92,10 @@ DEFAULT_CONFIG = {
     "log_export_hour": 23,
     "log_export_minute": 59,
     "log_export_second": 0,
+    # === 重试配置 ===
+    "retry_enabled": True,
+    "retry_count": 3,
+    "retry_interval_minutes": 5,
 }
 
 
@@ -96,8 +107,76 @@ def load_config():
 
 
 def save_config(config):
+    # 自动备份旧配置
+    if CONFIG_FILE.exists():
+        _auto_backup_config()
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
+
+
+def _auto_backup_config():
+    """自动备份配置文件，最多保留 MAX_CONFIG_BACKUPS 份"""
+    try:
+        CONFIG_BACKUP_DIR.mkdir(exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = CONFIG_BACKUP_DIR / f"config_backup_{ts}.json"
+        import shutil
+        shutil.copy2(CONFIG_FILE, backup_path)
+        # 清理旧备份
+        backups = sorted(CONFIG_BACKUP_DIR.glob("config_backup_*.json"))
+        while len(backups) > MAX_CONFIG_BACKUPS:
+            backups[0].unlink()
+            backups.pop(0)
+    except Exception:
+        pass  # 备份失败不影响主流程
+
+
+def export_config_to(config, dest_path):
+    """导出配置到指定文件"""
+    with open(dest_path, "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+
+
+def import_config_from(src_path):
+    """从文件导入配置，返回合并后的配置字典"""
+    with open(src_path, "r", encoding="utf-8") as f:
+        imported = json.load(f)
+    return {**DEFAULT_CONFIG, **imported}
+
+
+# ==================== 日志持久化 ====================
+def load_persisted_log():
+    """启动时加载持久化日志"""
+    entries = []
+    if LOG_PERSIST_FILE.exists():
+        try:
+            with open(LOG_PERSIST_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    # 格式: [cat] YYYY-MM-DD HH:MM:SS  msg  或纯文本
+                    m = re.match(r'^\[(下载|发送|系统|查询)\]\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s{2}(.*)', line)
+                    if m:
+                        cat_map = {"下载": "download", "发送": "send", "系统": "system", "查询": "query"}
+                        entries.append({"time": m.group(2), "cat": cat_map.get(m.group(1), "system"), "msg": m.group(3)})
+        except Exception:
+            pass
+    return entries
+
+
+def persist_log_entries(entries):
+    """将日志写入持久化文件"""
+    try:
+        lines_to_keep = entries[-MAX_LOG_LINES:]
+        LOG_CATEGORIES_LABELS = {"download": "下载", "send": "发送", "system": "系统", "query": "查询"}
+        with open(LOG_PERSIST_FILE, "w", encoding="utf-8") as f:
+            for entry in lines_to_keep:
+                prefix = LOG_CATEGORIES_LABELS.get(entry["cat"], "系统")
+                line = f"[{prefix}] {entry['time']}  {entry['msg']}"
+                f.write(line + "\n")
+    except Exception:
+        pass
 
 
 # ==================== 邮件处理核心 ====================
@@ -108,7 +187,6 @@ def decode_str(s):
     try:
         decoded_parts = decode_header(s)
     except RecursionError:
-        # 某些畸形邮件头会导致 decode_header 无限递归，兜底返回原始字符串
         return str(s) if isinstance(s, str) else s.decode("utf-8", errors="replace")
     result = []
     for part, charset in decoded_parts:
@@ -124,11 +202,8 @@ def decode_str(s):
 
 def clean_filename(name):
     """清理文件名中的非法字符"""
-    # 替换 Windows 非法字符
     name = re.sub(r'[\\/:*?"<>|]', "_", name)
-    # 去除控制字符 (0x00-0x1F)
     name = re.sub(r'[\x00-\x1f]', "", name)
-    # 去除首尾空白和点号（Windows 不允许以点结尾）
     name = name.strip(" .")
     if not name:
         name = "unnamed"
@@ -136,7 +211,7 @@ def clean_filename(name):
 
 
 def _try_decode_bytes(raw_bytes):
-    """尝试用多种编码解码字节序列，返回最佳结果"""
+    """尝试用多种编码解码字节序列"""
     for enc in ['utf-8', 'gb18030', 'gbk', 'gb2312', 'big5', 'latin-1']:
         try:
             trial = raw_bytes.decode(enc)
@@ -144,23 +219,15 @@ def _try_decode_bytes(raw_bytes):
                 return trial
         except Exception:
             continue
-    # 兜底：utf-8 with replace
     return raw_bytes.decode('utf-8', errors='replace')
 
 
 def _parse_rfc2231_value(raw_value):
-    """
-    解析 RFC 2231 编码的参数值，格式: charset'language'percent_encoded_value
-    返回解码后的 Unicode 字符串，解析失败返回 None
-    """
-    # 匹配 charset'language'value 模式
     m = re.match(r"([A-Za-z0-9_-]+)'([^']*)'(.+)", raw_value, re.DOTALL)
     if not m:
         return None
     charset = m.group(1)
-    # language 部分通常为空，忽略
     encoded_value = m.group(3)
-    # 先做 percent-decode
     try:
         decoded_bytes = unquote(encoded_value).encode('latin-1')
     except Exception:
@@ -168,43 +235,17 @@ def _parse_rfc2231_value(raw_value):
             decoded_bytes = unquote(encoded_value).encode('raw_unicode_escape')
         except Exception:
             return None
-    # 再按 charset 解码
     try:
         result = decoded_bytes.decode(charset, errors='replace')
         if '\ufffd' not in result:
             return result
     except Exception:
         pass
-    # charset 解码失败，尝试其他常见编码
     return _try_decode_bytes(decoded_bytes) or None
 
 
-def _get_raw_header_bytes(part, header_name):
-    """
-    从邮件 part 的原始数据中提取指定 header 的原始字节。
-    Python 3 的 email 模块会将 header 解码为 str，丢失原始编码信息。
-    此函数通过访问 part 的内部原始数据来获取未解码的字节。
-    """
-    # 方法1：尝试从 as_bytes 重新解析
-    try:
-        if hasattr(part, '_payload') and isinstance(part._payload, bytes):
-            raw = part._payload
-        else:
-            return None
-    except Exception:
-        return None
-    return None  # 此方法不可靠，回退
-
-
 def decode_attachment_filename(part):
-    """
-    万能附件文件名解码，修复乱码问题：
-    1. 优先解析 RFC 2231 filename* 参数（percent-encoding）
-    2. 从原始邮件字节中提取 filename（绕过 email 模块的预解码）
-    3. 回退到 get_filename() / 手动解析 Content-Disposition/Content-Type
-    """
-
-    # ---- 收集所有 header 的原始文本 ----
+    """万能附件文件名解码"""
     cd_value = ""
     ct_value = ""
     if hasattr(part, '_headers'):
@@ -218,43 +259,25 @@ def decode_attachment_filename(part):
     if not ct_value:
         ct_value = part.get('Content-Type', '')
 
-    # ---- 优先级1：RFC 2231 filename* (最规范的中文附件名编码方式) ----
-    # 格式: filename*=charset'lang'percent_encoded_value
-    # 也支持延续段: filename*0*=..., filename*1*=...
     rfc2231_parts = {}
-    rfc2231_charset = None
-
-    # 从 Content-Disposition 中提取所有 filename* 相关参数
-    # 匹配 filename*=, filename*0*=, filename*1*= 等
-    for m in re.finditer(
-        r"filename(\*(\d+))?\*\s*=\s*([^;]+)",
-        cd_value, re.IGNORECASE
-    ):
-        full_key = m.group(0)
+    for m in re.finditer(r"filename(\*(\d+))?\*\s*=\s*([^;]+)", cd_value, re.IGNORECASE):
         seg_index = int(m.group(2)) if m.group(2) is not None else -1
         raw_val = m.group(3).strip().strip('"')
-
-        # 首次遇到或无编号的 filename*
         if seg_index == -1:
-            # 完整的 filename*=charset'lang'value
             decoded = _parse_rfc2231_value(raw_val)
             if decoded and '\ufffd' not in decoded:
                 return decoded
         else:
             rfc2231_parts[seg_index] = raw_val
 
-    # 处理分段 filename*0*=, filename*1*= ...
     if rfc2231_parts:
-        # 第一段包含 charset 信息
         sorted_indices = sorted(rfc2231_parts.keys())
         first_val = rfc2231_parts[sorted_indices[0]]
         m_charset = re.match(r"([A-Za-z0-9_-]+)'([^']*)'(.+)", first_val, re.DOTALL)
+        rfc2231_charset = None
         if m_charset:
             rfc2231_charset = m_charset.group(1)
-            # 修正第一段：去掉 charset'lang' 前缀
             rfc2231_parts[sorted_indices[0]] = m_charset.group(3)
-
-        # 拼接所有段的 percent-encoded 值
         combined = "".join(rfc2231_parts[i] for i in sorted_indices if i in rfc2231_parts)
         try:
             decoded_bytes = unquote(combined).encode('latin-1')
@@ -267,19 +290,13 @@ def decode_attachment_filename(part):
         except Exception:
             pass
 
-    # ---- 优先级2：从原始邮件字节中提取 filename ----
-    # 通过重新解析邮件原始数据来获取未解码的 filename
     try:
-        # 尝试获取 part 的原始字节表示
         raw_bytes = part.as_bytes()
-        # 在原始字节中搜索 Content-Disposition header
         header_end = raw_bytes.find(b'\r\n\r\n')
         if header_end > 0:
             header_section = raw_bytes[:header_end]
         else:
-            header_section = raw_bytes[:2048]  # 限制搜索范围
-
-        # 在原始字节中搜索 filename
+            header_section = raw_bytes[:2048]
         for pattern in [
             rb'filename\*\s*=\s*([A-Za-z0-9_-]+)\'[^\']*\'([^\r\n;]+)',
             rb'filename\s*=\s*"([^"]+)"',
@@ -288,7 +305,6 @@ def decode_attachment_filename(part):
             m = re.search(pattern, header_section, re.IGNORECASE)
             if m:
                 if b"'" in m.group(0) and m.lastindex >= 2:
-                    # RFC 2231 格式
                     charset_bytes = m.group(1)
                     value_bytes = m.group(2)
                     try:
@@ -300,16 +316,12 @@ def decode_attachment_filename(part):
                     except Exception:
                         pass
                 else:
-                    # 普通 filename="xxx" 或 filename=xxx
                     raw_filename_bytes = m.group(1)
-                    # 去除可能的引号
                     if raw_filename_bytes.startswith(b'"') and raw_filename_bytes.endswith(b'"'):
                         raw_filename_bytes = raw_filename_bytes[1:-1]
                     result = _try_decode_bytes(raw_filename_bytes)
                     if result and '\ufffd' not in result:
                         return result
-
-        # 从 Content-Type 的 name 字段提取
         for pattern in [
             rb'name\*\s*=\s*([A-Za-z0-9_-]+)\'[^\']*\'([^\r\n;]+)',
             rb'name\s*=\s*"([^"]+)"',
@@ -336,15 +348,13 @@ def decode_attachment_filename(part):
                     if result and '\ufffd' not in result:
                         return result
     except Exception:
-        pass  # 原始字节解析失败，继续回退方案
+        pass
 
-    # ---- 优先级3：get_filename() ----
     filename = part.get_filename()
     if filename:
         result = decode_str(filename)
         if result and '\ufffd' not in result:
             return result
-        # get_filename() 返回的 str 可能已被错误解码，尝试恢复
         for recovery_enc in ['latin-1', 'cp1252', 'raw_unicode_escape']:
             try:
                 raw_bytes = filename.encode(recovery_enc, errors='surrogateescape')
@@ -355,37 +365,26 @@ def decode_attachment_filename(part):
             except Exception:
                 continue
 
-    # ---- 优先级4：从 cd_value / ct_value 手动解析 ----
     candidates = []
-
-    # RFC 2047 编码的 filename（如 =?utf-8?B?...?=）
     m = re.search(r'filename\s*=\s*=\?[^?]+\?[BQ]\?[^?]+\?=', cd_value, re.IGNORECASE)
     if m:
         candidates.append(m.group(0).split('=', 1)[1].strip())
-
-    # 普通带引号的 filename
     m = re.search(r'filename\s*=\s*"([^"]*)"', cd_value, re.IGNORECASE)
     if m:
         candidates.append(m.group(1))
-
-    # 不带引号的 filename
     m = re.search(r'filename\s*=\s*([^;"\s]+)', cd_value, re.IGNORECASE)
     if m and '"' not in m.group(0):
         candidates.append(m.group(1))
-
-    # Content-Type name
     m = re.search(r'name\s*=\s*"([^"]*)"', ct_value, re.IGNORECASE)
     if m:
         candidates.append(m.group(1))
     m = re.search(r'name\s*=\s*([^;\s"]+)', ct_value, re.IGNORECASE)
     if m and '"' not in m.group(0):
         candidates.append(m.group(1))
-
     for c in candidates:
         result = decode_str(c)
         if result and '\ufffd' not in result:
             return result
-        # 尝试恢复
         for recovery_enc in ['latin-1', 'cp1252', 'raw_unicode_escape']:
             try:
                 raw_bytes = c.encode(recovery_enc, errors='surrogateescape')
@@ -395,25 +394,38 @@ def decode_attachment_filename(part):
                         return result
             except Exception:
                 continue
-
-    # 兜底：返回第一个非空结果（即使有乱码）
     for c in candidates:
         if c:
             return decode_str(c)
     return None
 
 
+def text_file_preview(filepath, max_chars=500):
+    """预览文本文件内容"""
+    text_exts = {'.txt', '.csv', '.log', '.sql', '.json', '.xml', '.html', '.htm',
+                 '.py', '.js', '.ts', '.java', '.c', '.cpp', '.h', '.css', '.md',
+                 '.yaml', '.yml', '.ini', '.cfg', '.conf', '.bat', '.sh', '.ps1'}
+    ext = Path(filepath).suffix.lower()
+    if ext not in text_exts:
+        return None
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read(max_chars)
+        if len(content) == 0:
+            return "(空文件)"
+        if len(content) >= max_chars:
+            return content + "\n...(已截断)"
+        return content
+    except Exception:
+        return None
+
+
 # ==================== SSL兼容处理 ====================
 def _create_ssl_context(skip_verify=False):
-    """创建兼容的SSL上下文，解决Python 3.12+ SSL handshake failure"""
-    # 使用PROTOCOL_TLS_CLIENT自动协商最佳协议
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    # 兼容旧服务器的cipher suite
     ctx.set_ciphers("DEFAULT:@SECLEVEL=1")
-    # 允许传统重协商（Coremail等旧服务器需要）
     ctx.options |= ssl.OP_LEGACY_SERVER_CONNECT
-    ctx.options |= ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3  # 禁用不安全协议
-
+    ctx.options |= ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3
     if skip_verify:
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
@@ -421,11 +433,127 @@ def _create_ssl_context(skip_verify=False):
 
 
 def connect_imap(server, port, user, password, skip_ssl_verify=False):
-    """连接IMAP服务器"""
+    """连接IMAP服务器，SSL证书错误时自动回退到跳过验证模式"""
     ctx = _create_ssl_context(skip_verify=skip_ssl_verify)
-    mail = imaplib.IMAP4_SSL(server, port, ssl_context=ctx)
-    mail.login(user, password)
-    return mail
+    try:
+        mail = imaplib.IMAP4_SSL(server, port, ssl_context=ctx)
+        mail.login(user, password)
+        return mail
+    except ssl.SSLError as e:
+        if not skip_ssl_verify:
+            # 证书验证失败 → 自动用跳过验证重试
+            ctx = _create_ssl_context(skip_verify=True)
+            mail = imaplib.IMAP4_SSL(server, port, ssl_context=ctx)
+            mail.login(user, password)
+            return mail
+        else:
+            raise  # 已经跳过验证还失败，抛出原始异常
+    except imaplib.IMAP4.error:
+        # 非SSL错误直接抛出
+        raise
+
+
+def test_imap_connection(server, port, user, password, skip_ssl_verify=False):
+    """测试IMAP连接（仅登录，不执行操作）"""
+    mail = connect_imap(server, port, user, password, skip_ssl_verify)
+    mail.logout()
+    return True
+
+
+def test_smtp_connection(smtp_server, smtp_port, use_ssl, user, password, skip_ssl_verify):
+    """测试SMTP连接（仅登录，不发送）"""
+    ctx = _create_ssl_context(skip_verify=skip_ssl_verify)
+    if use_ssl:
+        server = smtplib.SMTP_SSL(smtp_server, smtp_port, context=ctx)
+    else:
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.ehlo()
+        server.starttls(context=ctx)
+        server.ehlo()
+    server.login(user, password)
+    server.quit()
+    return True
+
+
+def get_sent_folder_name(mail, log_func=None):
+    """自动检测已发送文件夹名称，支持国内外主流邮箱"""
+    status, folders = mail.list()
+    if status != "OK":
+        return None
+
+    # 提取所有文件夹名
+    all_folders = []
+    for folder_info in folders:
+        folder_str = folder_info.decode('utf-8', errors='replace') if isinstance(folder_info, bytes) else folder_info
+        # IMAP LIST 格式: '(\\HasNoChildren) "/" "Sent"' 或 '(\\HasChildren) "/" "[Gmail]"'
+        parts = folder_str.split('"')
+        if len(parts) >= 4:
+            all_folders.append(parts[-2])
+
+    if log_func:
+        log_func(f"服务器文件夹列表: {all_folders}")
+
+    # 候选已发送文件夹名（按匹配优先级排列）
+    candidates = [
+        'Sent Messages',          # QQ邮箱英文
+        'Sent Items',             # Outlook/Hotmail
+        'Sent Mail',              # Gmail
+        'Sent',                   # 通用英文
+        '已发送',                  # QQ/163/Coremail 中文
+        '已发送邮件',              # 部分企业邮箱
+        '&XfJT0ZAB-',            # IMAP UTF-7 编码的"已发送"
+        '&XfJT0ZABkK5O9g-',      # 另一种编码
+    ]
+
+    # 按优先级匹配
+    for candidate in candidates:
+        for f in all_folders:
+            if candidate.lower() in f.lower():
+                if log_func:
+                    log_func(f"匹配到已发送文件夹: {f}")
+                return f
+
+    # 兜底：在文件夹名中搜索"sent"或"已发送"关键词
+    for f in all_folders:
+        f_lower = f.lower()
+        if 'sent' in f_lower or '已发送' in f:
+            if log_func:
+                log_func(f"模糊匹配到已发送文件夹: {f}")
+            return f
+
+    if log_func:
+        log_func(f"未匹配到已发送文件夹，可用文件夹: {all_folders}")
+    return None
+
+
+def archive_to_sent(config, raw_email_bytes, log_func):
+    """通过IMAP将已发送邮件存档到已发送文件夹"""
+    try:
+        imap_server = config.get("imap_server", "")
+        send_user = config.get("send_user") or config.get("email_user", "")
+        send_pass = config.get("send_pass") or config.get("email_pass", "")
+        if not imap_server or not send_user:
+            log_func("  跳过存档: IMAP服务器或账号未配置")
+            return
+        mail = connect_imap(imap_server, config.get("imap_port", 993),
+                            send_user, send_pass,
+                            config.get("skip_ssl_verify", False))
+        sent_folder = get_sent_folder_name(mail, log_func=log_func)
+        if sent_folder:
+            # 使用双引号包裹（支持中文文件夹名和嵌套文件夹如 [Gmail]/Sent Mail）
+            quoted_folder = f'"{sent_folder}"' if ' ' in sent_folder or '/' in sent_folder else sent_folder
+            result = mail.append(quoted_folder, '\\Seen',
+                                 imaplib.Time2Internaldate(time.time()),
+                                 raw_email_bytes)
+            if result[0] == "OK":
+                log_func(f"  已存档到: {sent_folder}")
+            else:
+                log_func(f"  存档失败: {result}")
+        else:
+            log_func("  未找到已发送文件夹，跳过存档（可在日志中查看服务器文件夹列表）")
+        mail.logout()
+    except Exception as e:
+        log_func(f"  存档异常: {e}")
 
 
 def fetch_attachments(mail, sender_filter_list, save_folder, log_func,
@@ -433,22 +561,10 @@ def fetch_attachments(mail, sender_filter_list, save_folder, log_func,
                       filter_days=None, filter_time_enabled=False,
                       filter_time_start="00:00", filter_time_end="23:59",
                       filter_date_enabled=False, filter_date_start="", filter_date_end=""):
-    """
-    从收件箱中查找符合条件的邮件，下载附件
-    sender_filter_list: 发件人筛选列表（每个元素是一个关键词），空=不限发件人
-    keyword_filter: 主题关键词筛选，空=不限关键词
-    read_status: 已读/未读筛选: "all" / "unseen" / "seen"
-    filter_days: 仅下载这些星期几（1=周一..7=周日）的邮件，None/空=不限
-    filter_time_start, filter_time_end: 仅下载此时间段内的邮件（HH:MM），filter_time_enabled=False=不限
-    filter_date_start, filter_date_end: 仅下载此日期范围内的邮件（YYYY-MM-DD），filter_date_enabled=False=不限
-    """
     mail.select("INBOX")
-    # 搜索邮件：根据 read_status 使用不同 IMAP 搜索条件
-    # Coremail等部分服务器对SEEN搜索支持不好，改用UNSEEN+手动过滤
     if read_status == "unseen":
         search_criteria = "UNSEEN"
     else:
-        # "all" 或 "seen" → 获取全部邮件，再按需过滤
         search_criteria = "ALL"
     status, messages = mail.search(None, search_criteria)
     if status != "OK":
@@ -463,34 +579,28 @@ def fetch_attachments(mail, sender_filter_list, save_folder, log_func,
     log_func(f"收件箱共 {len(mail_ids)} 封邮件，筛选条件: 发件人={sender_filter_list}, 关键词={keyword_filter or '无'}, 状态={read_status}，开始扫描...")
     download_count = 0
 
-    # 只检查最近的邮件（避免每次都扫描全部）
-    # 只有"仅未读"模式才跳过已处理ID（避免遗漏已读变更/筛选条件变更的情况）
-    # "全部邮件"和"仅已读"模式每次都重新扫描所有邮件
     processed_file = Path(__file__).parent / "processed_ids.txt"
     processed_ids = set()
     if read_status == "unseen" and processed_file.exists():
         with open(processed_file, "r", encoding="utf-8") as f:
             processed_ids = set(line.strip() for line in f)
 
-    # 从最新开始检查，最多检查100封
     new_processed = set()
     for mail_id in reversed(mail_ids[-100:]):
         mail_id_str = mail_id.decode()
         if read_status == "unseen" and mail_id_str in processed_ids:
             continue
-
-        # 仅已读模式：手动检查邮件是否有 \Seen 标记
         if read_status == "seen":
             try:
                 flag_status, flag_data = mail.fetch(mail_id, "(FLAGS)")
                 if flag_status == "OK" and flag_data:
                     flags = str(flag_data[0])
                     if "\\Seen" not in flags:
-                        continue  # 未读，跳过
+                        continue
                 else:
-                    continue  # 获取FLAGS失败，保守跳过
+                    continue
             except Exception:
-                continue  # 获取FLAGS异常，保守跳过
+                continue
 
         status, msg_data = mail.fetch(mail_id, "(RFC822)")
         if status != "OK":
@@ -499,32 +609,25 @@ def fetch_attachments(mail, sender_filter_list, save_folder, log_func,
         for response_part in msg_data:
             if isinstance(response_part, tuple):
                 msg = email.message_from_bytes(response_part[1])
-                # 获取发件人
                 from_ = decode_str(msg.get("From", ""))
                 subject = decode_str(msg.get("Subject", ""))
-
-                # 检查发件人和关键词筛选
                 from_lower = from_.lower()
-                sender_matched = True  # 默认通过（未设发件人筛选时）
+                sender_matched = True
                 if sender_filter_list and any(f.strip() for f in sender_filter_list):
                     sender_matched = any(f.strip().lower() in from_lower for f in sender_filter_list if f.strip())
                 kw = (keyword_filter or "").strip().lower()
-                kw_matched = True  # 默认通过（未设关键词时）
+                kw_matched = True
                 if kw:
                     subj_lower = subject.lower()
                     kw_matched = kw in subj_lower
                 if not (sender_matched and kw_matched):
                     continue
-
-                # 邮件日期/时间过滤
                 date_str = msg.get("Date", "")
                 if date_str and ((filter_days and len(filter_days) < 7) or filter_time_enabled or filter_date_enabled):
                     try:
                         dt = parsedate_to_datetime(date_str)
-                        # 星期过滤
                         if filter_days and dt.isoweekday() not in filter_days:
                             continue
-                        # 时间段过滤
                         if filter_time_enabled:
                             h, m = dt.hour, dt.minute
                             t_start = int(filter_time_start.split(":")[0]) * 60 + int(filter_time_start.split(":")[1])
@@ -534,10 +637,8 @@ def fetch_attachments(mail, sender_filter_list, save_folder, log_func,
                                 if not (t_start <= now_t <= t_end):
                                     continue
                             else:
-                                # 跨日（如22:00~06:00）
                                 if not (now_t >= t_start or now_t <= t_end):
                                     continue
-                        # 日期范围过滤（年月日-年月日）
                         if filter_date_enabled and filter_date_start and filter_date_end:
                             dt_date = dt.date()
                             d_start = datetime.datetime.strptime(filter_date_start, "%Y-%m-%d").date()
@@ -545,23 +646,20 @@ def fetch_attachments(mail, sender_filter_list, save_folder, log_func,
                             if not (d_start <= dt_date <= d_end):
                                 continue
                     except Exception:
-                        pass  # 解析日期失败则跳过过滤
+                        pass
 
                 log_func(f"  匹配发件人: {from_} | 主题: {subject}")
 
-                # 遍历邮件各部分，提取附件
                 if msg.is_multipart():
                     for part in msg.walk():
                         content_disposition = str(part.get("Content-Disposition", ""))
                         if "attachment" in content_disposition:
                             filename = decode_attachment_filename(part)
                             if not filename:
-                                # 解码失败，记录原始头信息便于排查
-                                log_func(f"   ⚠ 附件解码失败，Content-Disposition: {content_disposition}, Content-Type: {part.get('Content-Type', '')}")
+                                log_func(f"   ⚠ 附件解码失败")
                                 continue
                             filename = clean_filename(filename)
                             filepath = os.path.join(save_folder, filename)
-                            # 处理重名：追加下载时间戳
                             if os.path.exists(filepath):
                                 base, ext = os.path.splitext(filename)
                                 ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -571,13 +669,11 @@ def fetch_attachments(mail, sender_filter_list, save_folder, log_func,
                             log_func(f"    -> 已下载: {os.path.basename(filepath)}")
                             download_count += 1
                 else:
-                    # 非multipart也可能是附件
-                    content_type = msg.get_content_type()
                     content_disposition = str(msg.get("Content-Disposition", ""))
                     if "attachment" in content_disposition:
                         filename = decode_attachment_filename(msg)
                         if not filename:
-                            log_func(f"   ⚠ 附件解码失败，Content-Disposition: {content_disposition}, Content-Type: {msg.get('Content-Type', '')}")
+                            log_func(f"   ⚠ 附件解码失败")
                             continue
                         filename = clean_filename(filename)
                         filepath = os.path.join(save_folder, filename)
@@ -592,40 +688,43 @@ def fetch_attachments(mail, sender_filter_list, save_folder, log_func,
 
                 new_processed.add(mail_id_str)
 
-    # 更新已处理记录
     all_processed = processed_ids | new_processed
-    # 只保留最近1000条
     all_processed_list = list(all_processed)
     if len(all_processed_list) > 1000:
         all_processed_list = all_processed_list[-1000:]
     with open(processed_file, "w", encoding="utf-8") as f:
         for mid in all_processed_list:
             f.write(mid + "\n")
-
     return download_count
 
 
 def send_email(smtp_server, smtp_port, use_ssl, user, password, to_addr,
-               subject, body, attachment_paths, skip_ssl_verify, log_func):
+               subject, body, attachment_paths, skip_ssl_verify, log_func,
+               config=None):
     """通过SMTP发送邮件（带附件），attachment_paths 为文件路径列表"""
-    # 解析收件人（去空格、去空串）
     recipients = [r.strip() for r in to_addr.split(",") if r.strip()]
     if not recipients:
         raise ValueError("收件人列表为空")
 
-    # 构建邮件
+    # 附件预检
+    if attachment_paths:
+        missing = [p for p in attachment_paths if not os.path.isfile(p)]
+        if missing:
+            log_func(f"  ⚠ 以下附件不存在: {missing}")
+            # 过滤掉不存在的附件继续发送
+            attachment_paths = [p for p in attachment_paths if os.path.isfile(p)]
+            if not attachment_paths:
+                log_func("  所有附件均不存在，将以无附件方式发送")
+
     msg = MIMEMultipart()
     msg["From"] = user
     msg["To"] = ", ".join(recipients)
     msg["Subject"] = subject or "(无主题)"
-    # 添加 Coremail 等服务器需要的标准头，避免 550 Mail rejected
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid()
 
-    # 正文（无正文时间发一个空行，避免空邮件被拒）
     msg.attach(MIMEText(body or " ", "plain", "utf-8"))
 
-    # 附件（支持多个）
     total_size = 0
     if attachment_paths:
         for att_path in attachment_paths:
@@ -636,17 +735,19 @@ def send_email(smtp_server, smtp_port, use_ssl, user, password, to_addr,
                     part = MIMEBase("application", "octet-stream")
                     part.set_payload(f.read())
                 encoders.encode_base64(part)
-                # 文件名使用 RFC 5987 编码，兼容中文和特殊字符
                 part.add_header("Content-Disposition", "attachment",
                                 filename=("utf-8", "", filename))
                 msg.attach(part)
                 total_size += file_size
                 log_func(f"  附件: {filename} ({file_size} 字节)")
+                # 文本文件预览
+                preview = text_file_preview(att_path)
+                if preview:
+                    log_func(f"  附件预览(文本):\n{preview[:300]}")
         log_func(f"  共 {len(attachment_paths)} 个附件，总大小 {total_size} 字节")
     else:
         log_func("  无附件")
 
-    # 发送
     ctx = _create_ssl_context(skip_verify=skip_ssl_verify)
     if use_ssl:
         server = smtplib.SMTP_SSL(smtp_server, smtp_port, context=ctx)
@@ -657,10 +758,157 @@ def send_email(smtp_server, smtp_port, use_ssl, user, password, to_addr,
         server.ehlo()
 
     server.login(user, password)
-    # from_addr 必须与登录用户一致，否则 Coremail 会 550 拒绝
     server.sendmail(user, recipients, msg.as_string())
     server.quit()
     log_func(f"  邮件已发送 -> {', '.join(recipients)}")
+
+    # 存档到已发送文件夹
+    if config:
+        archive_to_sent(config, msg.as_bytes(), log_func)
+
+
+def query_emails(mail, folder, search_criteria, max_count=50, log_func=None,
+                 start_date=None, end_date=None):
+    """查询指定文件夹中的邮件列表，返回邮件摘要列表
+    
+    start_date/end_date: 日期字符串 "YYYY-MM-DD"，可筛选日期范围
+    """
+    # 智能选择文件夹：简单文件夹名不加引号，含空格/特殊字符才加
+    if " " in folder or "/" in folder or any(ord(c) > 127 for c in folder):
+        select_name = f'"{folder}"'
+    else:
+        select_name = folder
+    try:
+        mail.select(select_name)
+    except Exception:
+        # 回退：尝试不带引号
+        try:
+            mail.select(folder)
+        except Exception as e:
+            if log_func:
+                log_func(f"无法选择文件夹 {folder}: {e}")
+            return []
+
+    # 构建完整 IMAP 搜索条件（含日期范围）
+    parts = []
+    if search_criteria and search_criteria != "ALL":
+        parts.append(search_criteria)
+    if start_date:
+        # IMAP SINCE 格式: DD-Mon-YYYY
+        try:
+            dt = datetime.datetime.strptime(start_date, "%Y-%m-%d")
+            parts.append(f'SINCE "{dt.strftime("%d-%b-%Y")}"')
+        except ValueError:
+            pass
+    if end_date:
+        try:
+            dt = datetime.datetime.strptime(end_date, "%Y-%m-%d")
+            parts.append(f'BEFORE "{dt.strftime("%d-%b-%Y")}"')
+        except ValueError:
+            pass
+
+    if parts:
+        criteria = " ".join(parts)
+    else:
+        criteria = "ALL"
+
+    if log_func:
+        log_func(f"已选择文件夹: {folder}, 搜索条件: {criteria}")
+
+    status, messages = mail.search(None, criteria)
+    if status != "OK":
+        if log_func:
+            log_func(f"搜索失败, status={status}")
+        return []
+
+    mail_ids = messages[0].split()
+    if log_func:
+        log_func(f"找到 {len(mail_ids)} 封邮件")
+
+    result = []
+    for mail_id in reversed(mail_ids[-max_count:]):
+        status, msg_data = mail.fetch(mail_id, "(RFC822)")
+        if status != "OK":
+            continue
+        for response_part in msg_data:
+            if isinstance(response_part, tuple):
+                # IMAP FETCH 返回 (元数据, 邮件内容) 二元组，索引 1 才是真实邮件
+                raw_bytes = response_part[1]
+                msg = email.message_from_bytes(raw_bytes)
+                date_str = msg.get("Date", "")
+                try:
+                    dt = parsedate_to_datetime(date_str)
+                    date_formatted = dt.strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    date_formatted = date_str
+                result.append({
+                    "id": mail_id.decode(),
+                    "from": decode_str(msg.get("From", "")),
+                    "to": decode_str(msg.get("To", "")),
+                    "subject": decode_str(msg.get("Subject", "")),
+                    "date": date_formatted,
+                    "has_attachments": "attachment" in str(msg).lower(),
+                })
+    return result
+
+
+def fetch_email_detail(mail, mail_id, log_func=None):
+    """获取单封邮件的详细信息"""
+    status, msg_data = mail.fetch(mail_id.encode(), "(RFC822)")
+    if status != "OK":
+        return None
+    for response_part in msg_data:
+        if isinstance(response_part, tuple):
+            msg = email.message_from_bytes(response_part[1])
+            detail = {
+                "from": decode_str(msg.get("From", "")),
+                "to": decode_str(msg.get("To", "")),
+                "cc": decode_str(msg.get("Cc", "")),
+                "subject": decode_str(msg.get("Subject", "")),
+                "date": msg.get("Date", ""),
+                "body": "",
+                "attachments": [],
+            }
+            # 提取正文和附件
+            if msg.is_multipart():
+                for part in msg.walk():
+                    content_type = part.get_content_type()
+                    content_disposition = str(part.get("Content-Disposition", ""))
+                    if "attachment" in content_disposition:
+                        filename = decode_attachment_filename(part)
+                        if filename:
+                            detail["attachments"].append({
+                                "filename": filename,
+                                "size": len(part.get_payload(decode=True) or b""),
+                                "payload": part.get_payload(decode=True),
+                            })
+                    elif content_type == "text/plain" and "attachment" not in content_disposition:
+                        try:
+                            payload = part.get_payload(decode=True)
+                            if payload:
+                                detail["body"] = _try_decode_bytes(payload)[:5000]
+                        except Exception:
+                            pass
+            else:
+                content_type = msg.get_content_type()
+                content_disposition = str(msg.get("Content-Disposition", ""))
+                if "attachment" in content_disposition:
+                    filename = decode_attachment_filename(msg)
+                    if filename:
+                        detail["attachments"].append({
+                            "filename": filename,
+                            "size": len(msg.get_payload(decode=True) or b""),
+                            "payload": msg.get_payload(decode=True),
+                        })
+                elif content_type == "text/plain":
+                    try:
+                        payload = msg.get_payload(decode=True)
+                        if payload:
+                            detail["body"] = _try_decode_bytes(payload)[:5000]
+                    except Exception:
+                        pass
+            return detail
+    return None
 
 
 # ==================== GUI ====================
@@ -669,41 +917,52 @@ class MailAttachmentTool:
 
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("邮件自动化工具")
-        self.root.geometry("720x680")
+        self.root.title("邮件自动化工具HK")
+        self.root.geometry("780x800")
         self.root.resizable(True, True)
 
         self.config = load_config()
         self.running = False
         self.stop_event = threading.Event()
         self.scheduler_thread = None
-        self.tray_icon = None  # 托盘图标
-        self.log_entries = []  # 结构化日志: [{"time":..., "cat":..., "msg":...}]
-        self.log_filter = "all"  # all / download / send
+        self.tray_icon = None
+        # 加载持久化日志
+        self.log_entries = load_persisted_log()
+        self.log_filter = "all"
+        self.last_error_time = {}  # 错误去重: {error_key: timestamp}
+        self.retry_state = {}  # 重试状态: {task_type: {"fail_count": N, "last_fail": ts}}
 
         self._build_ui()
-        self._load_config_to_ui()
+        self._start_clock_update()
 
-        # 启动日志
         self.log("程序已启动，请配置参数后点击【启动定时任务】")
 
     # ---------- UI构建 ----------
     def _build_ui(self):
-        # 主容器
         main_frame = ttk.Frame(self.root, padding=10)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
         # --- 标题 ---
         title = ttk.Label(main_frame, text="邮件附件定时下载 & 邮件定时发送",
                           font=("Microsoft YaHei", 14, "bold"))
-        title.pack(pady=(0, 10))
+        title.pack(pady=(0, 5))
+
+        # --- 时间显示栏 (功能5) ---
+        self.time_frame = ttk.Frame(main_frame)
+        self.time_frame.pack(fill=tk.X, pady=(0, 8))
+        self.time_label = ttk.Label(self.time_frame, text="",
+                                     font=("Consolas", 10), foreground="#0078D4")
+        self.time_label.pack(side=tk.LEFT)
+        self.next_task_label = ttk.Label(self.time_frame, text="",
+                                          font=("Consolas", 9), foreground="#555")
+        self.next_task_label.pack(side=tk.LEFT, padx=(20, 0))
 
         # 笔记本（选项卡）
         notebook = ttk.Notebook(main_frame)
         notebook.pack(fill=tk.BOTH, expand=True)
 
         # ================================================================
-        # Tab 1: 下载配置（IMAP + 定时）
+        # Tab 1: 下载配置
         # ================================================================
         tab_dl = ttk.Frame(notebook, padding=10)
         notebook.add(tab_dl, text="下载配置")
@@ -713,7 +972,6 @@ class MailAttachmentTool:
         dl_inner.columnconfigure(1, weight=1)
 
         row = 0
-        # --- 服务器 ---
         ttk.Label(dl_inner, text="IMAP服务器:").grid(row=row, column=0, sticky=tk.W, pady=2)
         self.entry_server = ttk.Entry(dl_inner, width=35)
         self.entry_server.grid(row=row, column=1, sticky=tk.W, pady=2, padx=(5, 0))
@@ -758,7 +1016,7 @@ class MailAttachmentTool:
         ttk.Label(dl_inner, text="主题关键词:").grid(row=row, column=0, sticky=tk.W, pady=2)
         self.entry_keyword = ttk.Entry(dl_inner, width=35)
         self.entry_keyword.grid(row=row, column=1, sticky=tk.W, pady=2, padx=(5, 0))
-        ttk.Label(dl_inner, text="(筛选主题含此关键词的邮件，与发件人可共用)", foreground="gray").grid(
+        ttk.Label(dl_inner, text="(筛选主题含此关键词的邮件)", foreground="gray").grid(
             row=row, column=2, sticky=tk.W, pady=2, padx=5)
         row += 1
 
@@ -784,18 +1042,14 @@ class MailAttachmentTool:
                                                             sticky=tk.EW, pady=8)
         row += 1
 
-        # --- 下载定时 ---
-        ttk.Label(dl_inner, text="定时设置",
-                  font=("", 10, "bold")).grid(row=row, column=0, columnspan=3, sticky=tk.W)
+        ttk.Label(dl_inner, text="定时设置", font=("", 10, "bold")).grid(row=row, column=0, columnspan=3, sticky=tk.W)
         row += 1
 
         self.var_dl_enabled = tk.BooleanVar(value=True)
-        self.cb_dl_enabled = ttk.Checkbutton(dl_inner, text="启用定时下载",
-                                             variable=self.var_dl_enabled)
+        self.cb_dl_enabled = ttk.Checkbutton(dl_inner, text="启用定时下载", variable=self.var_dl_enabled)
         self.cb_dl_enabled.grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=2)
         row += 1
 
-        # 星期选择
         dl_day_frame = ttk.Frame(dl_inner)
         dl_day_frame.grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=2)
         self.day_vars = []
@@ -805,7 +1059,6 @@ class MailAttachmentTool:
             ttk.Checkbutton(dl_day_frame, text=name, variable=var).pack(side=tk.LEFT, padx=4)
         row += 1
 
-        # 时间
         dl_time_frame = ttk.Frame(dl_inner)
         dl_time_frame.grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=2)
         ttk.Label(dl_time_frame, text="时").pack(side=tk.LEFT)
@@ -819,7 +1072,7 @@ class MailAttachmentTool:
         self.spin_sec.pack(side=tk.LEFT, padx=(2, 5)); self.spin_sec.set("0")
         row += 1
 
-        # --- 邮件筛选（可选） ---
+        # 邮件筛选
         ttk.Separator(dl_inner, orient=tk.HORIZONTAL).grid(row=row, column=0, columnspan=3,
                                                             sticky=tk.EW, pady=8)
         row += 1
@@ -827,7 +1080,6 @@ class MailAttachmentTool:
                   font=("", 10, "bold")).grid(row=row, column=0, columnspan=3, sticky=tk.W)
         row += 1
 
-        # 邮件接收星期
         ttk.Label(dl_inner, text="接收日:").grid(row=row, column=0, sticky=tk.W, pady=2)
         dl_email_day_frame = ttk.Frame(dl_inner)
         dl_email_day_frame.grid(row=row, column=1, columnspan=2, sticky=tk.W, pady=2)
@@ -839,13 +1091,11 @@ class MailAttachmentTool:
         ttk.Label(dl_email_day_frame, text=" (空=不限)", foreground="gray").pack(side=tk.LEFT)
         row += 1
 
-        # 邮件接收时间段
         ttk.Label(dl_inner, text="接收时间段:").grid(row=row, column=0, sticky=tk.W, pady=2)
         dl_email_time_frame = ttk.Frame(dl_inner)
         dl_email_time_frame.grid(row=row, column=1, columnspan=2, sticky=tk.W, pady=2)
         self.var_dl_email_time = tk.BooleanVar()
-        ttk.Checkbutton(dl_email_time_frame, text="启用",
-                        variable=self.var_dl_email_time).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Checkbutton(dl_email_time_frame, text="启用", variable=self.var_dl_email_time).pack(side=tk.LEFT, padx=(0, 5))
         self.spin_dl_email_h1 = ttk.Spinbox(dl_email_time_frame, from_=0, to=23, width=3, justify=tk.CENTER)
         self.spin_dl_email_h1.pack(side=tk.LEFT); self.spin_dl_email_h1.set("0")
         ttk.Label(dl_email_time_frame, text=":").pack(side=tk.LEFT)
@@ -859,13 +1109,11 @@ class MailAttachmentTool:
         self.spin_dl_email_m2.pack(side=tk.LEFT); self.spin_dl_email_m2.set("59")
         row += 1
 
-        # 邮件接收日期范围
         ttk.Label(dl_inner, text="接收日期范围:").grid(row=row, column=0, sticky=tk.W, pady=2)
         dl_email_date_frame = ttk.Frame(dl_inner)
         dl_email_date_frame.grid(row=row, column=1, columnspan=2, sticky=tk.W, pady=2)
         self.var_dl_email_date = tk.BooleanVar()
-        ttk.Checkbutton(dl_email_date_frame, text="启用",
-                        variable=self.var_dl_email_date).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Checkbutton(dl_email_date_frame, text="启用", variable=self.var_dl_email_date).pack(side=tk.LEFT, padx=(0, 5))
         self.entry_dl_email_date1 = ttk.Entry(dl_email_date_frame, width=11)
         self.entry_dl_email_date1.pack(side=tk.LEFT)
         ttk.Label(dl_email_date_frame, text=" ~ ").pack(side=tk.LEFT)
@@ -877,14 +1125,16 @@ class MailAttachmentTool:
         dl_btn_frame = ttk.Frame(dl_inner)
         dl_btn_frame.grid(row=row, column=0, columnspan=3, pady=8)
         ttk.Button(dl_btn_frame, text="立即执行一次", command=self._test_and_run,
-                   width=16).pack(side=tk.LEFT, padx=3)
+                   width=14).pack(side=tk.LEFT, padx=3)
+        ttk.Button(dl_btn_frame, text="测试IMAP连接", command=self._test_imap_btn,
+                   width=14).pack(side=tk.LEFT, padx=3)
         ttk.Button(dl_btn_frame, text="保存配置", command=self._save_download_config,
-                   width=12).pack(side=tk.LEFT, padx=3)
+                   width=10).pack(side=tk.LEFT, padx=3)
         ttk.Button(dl_btn_frame, text="清除配置", command=self._clear_download_config,
-                   width=12).pack(side=tk.LEFT, padx=3)
+                   width=10).pack(side=tk.LEFT, padx=3)
 
         # ================================================================
-        # Tab 2: 发送配置（SMTP + 定时）
+        # Tab 2: 发送配置
         # ================================================================
         tab_send = ttk.Frame(notebook, padding=10)
         notebook.add(tab_send, text="发送配置")
@@ -894,7 +1144,6 @@ class MailAttachmentTool:
         send_inner.columnconfigure(1, weight=1)
 
         srow = 0
-        # --- SMTP服务器 ---
         ttk.Label(send_inner, text="SMTP服务器:").grid(row=srow, column=0, sticky=tk.W, pady=2)
         self.entry_smtp_server = ttk.Entry(send_inner, width=35)
         self.entry_smtp_server.grid(row=srow, column=1, sticky=tk.W, pady=2, padx=(5, 0))
@@ -949,50 +1198,40 @@ class MailAttachmentTool:
         ttk.Label(send_inner, text="邮件正文:").grid(row=srow, column=0, sticky=tk.NW, pady=2)
         body_frame = ttk.Frame(send_inner)
         body_frame.grid(row=srow, column=1, columnspan=2, sticky=tk.EW, pady=2, padx=(5, 0))
-        self.text_send_body = tk.Text(body_frame, width=35, height=5, wrap=tk.WORD,
-                                       font=("", 9))
+        self.text_send_body = tk.Text(body_frame, width=35, height=5, wrap=tk.WORD, font=("", 9))
         self.text_send_body.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         body_scroll = ttk.Scrollbar(body_frame, command=self.text_send_body.yview)
         body_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.text_send_body.config(yscrollcommand=body_scroll.set)
         srow += 1
 
-        # 附件
         ttk.Label(send_inner, text="附件:").grid(row=srow, column=0, sticky=tk.NW, pady=2)
         att_mode_frame = ttk.Frame(send_inner)
         att_mode_frame.grid(row=srow, column=1, columnspan=2, sticky=tk.W, pady=2, padx=(5, 0))
         self.var_att_mode = tk.StringVar(value="single")
-        ttk.Radiobutton(att_mode_frame, text="单文件", variable=self.var_att_mode,
-                        value="single").pack(side=tk.LEFT)
-        ttk.Radiobutton(att_mode_frame, text="多文件", variable=self.var_att_mode,
-                        value="multi").pack(side=tk.LEFT, padx=8)
-        ttk.Radiobutton(att_mode_frame, text="文件夹", variable=self.var_att_mode,
-                        value="folder").pack(side=tk.LEFT, padx=8)
+        ttk.Radiobutton(att_mode_frame, text="单文件", variable=self.var_att_mode, value="single").pack(side=tk.LEFT)
+        ttk.Radiobutton(att_mode_frame, text="多文件", variable=self.var_att_mode, value="multi").pack(side=tk.LEFT, padx=8)
+        ttk.Radiobutton(att_mode_frame, text="文件夹", variable=self.var_att_mode, value="folder").pack(side=tk.LEFT, padx=8)
         srow += 1
 
         self.entry_send_attachment = ttk.Entry(send_inner, width=35)
         self.entry_send_attachment.grid(row=srow, column=1, sticky=tk.EW, pady=2, padx=(5, 0))
         att_btn_frame = ttk.Frame(send_inner)
         att_btn_frame.grid(row=srow, column=2, sticky=tk.W, pady=2, padx=5)
-        ttk.Button(att_btn_frame, text="浏览...", command=self._browse_send_att,
-                   width=8).pack(side=tk.LEFT)
+        ttk.Button(att_btn_frame, text="浏览...", command=self._browse_send_att, width=8).pack(side=tk.LEFT)
         ttk.Button(att_btn_frame, text="清空",
-                   command=lambda: self.entry_send_attachment.delete(0, tk.END),
-                   width=6).pack(side=tk.LEFT, padx=3)
+                   command=lambda: self.entry_send_attachment.delete(0, tk.END), width=6).pack(side=tk.LEFT, padx=3)
         srow += 1
 
         ttk.Separator(send_inner, orient=tk.HORIZONTAL).grid(row=srow, column=0, columnspan=3,
                                                               sticky=tk.EW, pady=8)
         srow += 1
 
-        # --- 发送定时 ---
-        ttk.Label(send_inner, text="定时设置",
-                  font=("", 10, "bold")).grid(row=srow, column=0, columnspan=3, sticky=tk.W)
+        ttk.Label(send_inner, text="定时设置", font=("", 10, "bold")).grid(row=srow, column=0, columnspan=3, sticky=tk.W)
         srow += 1
 
         self.var_sd_enabled = tk.BooleanVar(value=False)
-        ttk.Checkbutton(send_inner, text="启用定时发送",
-                        variable=self.var_sd_enabled).grid(
+        ttk.Checkbutton(send_inner, text="启用定时发送", variable=self.var_sd_enabled).grid(
             row=srow, column=0, columnspan=3, sticky=tk.W, pady=2)
         srow += 1
 
@@ -1008,35 +1247,114 @@ class MailAttachmentTool:
         sd_time_frame = ttk.Frame(send_inner)
         sd_time_frame.grid(row=srow, column=0, columnspan=3, sticky=tk.W, pady=2)
         ttk.Label(sd_time_frame, text="时").pack(side=tk.LEFT)
-        self.spin_send_hour = ttk.Spinbox(sd_time_frame, from_=0, to=23, width=4,
-                                          justify=tk.CENTER)
+        self.spin_send_hour = ttk.Spinbox(sd_time_frame, from_=0, to=23, width=4, justify=tk.CENTER)
         self.spin_send_hour.pack(side=tk.LEFT, padx=(2, 5)); self.spin_send_hour.set("8")
         ttk.Label(sd_time_frame, text="分").pack(side=tk.LEFT)
-        self.spin_send_min = ttk.Spinbox(sd_time_frame, from_=0, to=59, width=4,
-                                         justify=tk.CENTER)
+        self.spin_send_min = ttk.Spinbox(sd_time_frame, from_=0, to=59, width=4, justify=tk.CENTER)
         self.spin_send_min.pack(side=tk.LEFT, padx=(2, 5)); self.spin_send_min.set("0")
         ttk.Label(sd_time_frame, text="秒").pack(side=tk.LEFT)
-        self.spin_send_sec = ttk.Spinbox(sd_time_frame, from_=0, to=59, width=4,
-                                         justify=tk.CENTER)
+        self.spin_send_sec = ttk.Spinbox(sd_time_frame, from_=0, to=59, width=4, justify=tk.CENTER)
         self.spin_send_sec.pack(side=tk.LEFT, padx=(2, 5)); self.spin_send_sec.set("0")
         srow += 1
 
         sd_btn_frame = ttk.Frame(send_inner)
         sd_btn_frame.grid(row=srow, column=0, columnspan=3, pady=8)
         ttk.Button(sd_btn_frame, text="立即执行一次", command=self._test_send,
-                   width=16).pack(side=tk.LEFT, padx=3)
+                   width=14).pack(side=tk.LEFT, padx=3)
+        ttk.Button(sd_btn_frame, text="测试SMTP连接", command=self._test_smtp_btn,
+                   width=14).pack(side=tk.LEFT, padx=3)
         ttk.Button(sd_btn_frame, text="保存配置", command=self._save_send_config,
-                   width=12).pack(side=tk.LEFT, padx=3)
+                   width=10).pack(side=tk.LEFT, padx=3)
         ttk.Button(sd_btn_frame, text="清除配置", command=self._clear_send_config,
-                   width=12).pack(side=tk.LEFT, padx=3)
+                   width=10).pack(side=tk.LEFT, padx=3)
 
         # ================================================================
-        # Tab 3: 运行日志
+        # Tab 3: 邮件查询 (功能3)
+        # ================================================================
+        tab_query = ttk.Frame(notebook, padding=5)
+        notebook.add(tab_query, text="邮件查询")
+
+        # 查询控制栏 — 第一行：文件夹 + 关键词 + 操作按钮
+        query_ctrl1 = ttk.Frame(tab_query)
+        query_ctrl1.pack(fill=tk.X, pady=(0, 2))
+
+        ttk.Label(query_ctrl1, text="文件夹:").pack(side=tk.LEFT)
+        self.query_folder_var = tk.StringVar(value="INBOX")
+        self.combo_query_folder = ttk.Combobox(query_ctrl1, width=15, state="readonly",
+                                               values=["INBOX", "已发送"])
+        self.combo_query_folder.pack(side=tk.LEFT, padx=3)
+        self.combo_query_folder.set("INBOX")
+
+        ttk.Label(query_ctrl1, text="搜索关键词:").pack(side=tk.LEFT, padx=(10, 0))
+        self.entry_query_keyword = ttk.Entry(query_ctrl1, width=20)
+        self.entry_query_keyword.pack(side=tk.LEFT, padx=3)
+
+        ttk.Button(query_ctrl1, text="查询", command=self._do_mail_query, width=8).pack(side=tk.LEFT, padx=3)
+        ttk.Button(query_ctrl1, text="刷新列表", command=self._do_mail_query, width=8).pack(side=tk.LEFT, padx=3)
+
+        # 查询控制栏 — 第二行：日期范围 + 数量
+        query_ctrl2 = ttk.Frame(tab_query)
+        query_ctrl2.pack(fill=tk.X, pady=(0, 5))
+
+        ttk.Label(query_ctrl2, text="起始:").pack(side=tk.LEFT)
+        self.entry_query_start_date = ttk.Entry(query_ctrl2, width=10, justify=tk.CENTER)
+        self.entry_query_start_date.pack(side=tk.LEFT, padx=2)
+        self.entry_query_start_date.insert(0, "")
+        ttk.Label(query_ctrl2, text="截止:").pack(side=tk.LEFT, padx=(5, 0))
+        self.entry_query_end_date = ttk.Entry(query_ctrl2, width=10, justify=tk.CENTER)
+        self.entry_query_end_date.pack(side=tk.LEFT, padx=2)
+        self.entry_query_end_date.insert(0, "")
+
+        ttk.Label(query_ctrl2, text="数量:").pack(side=tk.LEFT, padx=(10, 0))
+        self.spin_query_count = ttk.Spinbox(query_ctrl2, from_=10, to=200, width=5, justify=tk.CENTER)
+        self.spin_query_count.pack(side=tk.LEFT, padx=(2, 5))
+        self.spin_query_count.set("50")
+
+        # 邮件列表 + 详情 左右分栏
+        query_paned = ttk.PanedWindow(tab_query, orient=tk.HORIZONTAL)
+        query_paned.pack(fill=tk.BOTH, expand=True)
+
+        # 左侧：邮件列表 (Treeview)
+        list_frame = ttk.Frame(query_paned)
+        query_paned.add(list_frame, weight=3)
+
+        columns = ("发件人/收件人", "主题", "日期")
+        self.mail_tree = ttk.Treeview(list_frame, columns=columns, show="headings",
+                                       selectmode="browse", height=15)
+        self.mail_tree.heading("发件人/收件人", text="发件人/收件人")
+        self.mail_tree.heading("主题", text="主题")
+        self.mail_tree.heading("日期", text="日期")
+        self.mail_tree.column("发件人/收件人", width=160)
+        self.mail_tree.column("主题", width=200)
+        self.mail_tree.column("日期", width=110)
+        self.mail_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tree_scroll = ttk.Scrollbar(list_frame, command=self.mail_tree.yview)
+        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.mail_tree.config(yscrollcommand=tree_scroll.set)
+        self.mail_tree.bind("<<TreeviewSelect>>", self._on_mail_select)
+
+        # 右侧：邮件详情
+        detail_frame = ttk.Frame(query_paned)
+        query_paned.add(detail_frame, weight=2)
+
+        ttk.Label(detail_frame, text="邮件详情", font=("", 10, "bold")).pack(anchor=tk.W, pady=(0, 5))
+        self.mail_detail_text = scrolledtext.ScrolledText(detail_frame, wrap=tk.WORD,
+                                                           font=("Consolas", 9),
+                                                           state=tk.DISABLED, height=20)
+        self.mail_detail_text.pack(fill=tk.BOTH, expand=True)
+
+        detail_btn_frame = ttk.Frame(detail_frame)
+        detail_btn_frame.pack(fill=tk.X, pady=(5, 0))
+        ttk.Button(detail_btn_frame, text="下载此邮件附件",
+                   command=self._download_query_attachment, width=16).pack(side=tk.LEFT, padx=3)
+        self.query_detail_data = None  # 缓存选中邮件的详情
+
+        # ================================================================
+        # Tab 4: 运行日志
         # ================================================================
         tab_log = ttk.Frame(notebook, padding=5)
         notebook.add(tab_log, text="运行日志")
 
-        # 筛选 + 导出按钮栏
         log_toolbar = ttk.Frame(tab_log)
         log_toolbar.pack(fill=tk.X, pady=(0, 3))
         ttk.Label(log_toolbar, text="筛选:").pack(side=tk.LEFT)
@@ -1046,6 +1364,8 @@ class MailAttachmentTool:
                    command=lambda: self._apply_log_filter("download")).pack(side=tk.LEFT, padx=2)
         ttk.Button(log_toolbar, text="发送", width=6,
                    command=lambda: self._apply_log_filter("send")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(log_toolbar, text="查询", width=6,
+                   command=lambda: self._apply_log_filter("query")).pack(side=tk.LEFT, padx=2)
         ttk.Button(log_toolbar, text="系统", width=6,
                    command=lambda: self._apply_log_filter("system")).pack(side=tk.LEFT, padx=2)
         ttk.Button(log_toolbar, text="导出日志", width=10,
@@ -1053,7 +1373,6 @@ class MailAttachmentTool:
         ttk.Button(log_toolbar, text="清空日志", width=10,
                    command=self._clear_log).pack(side=tk.RIGHT, padx=2)
 
-        # 日志文本框
         self.log_text = scrolledtext.ScrolledText(tab_log, wrap=tk.WORD,
                                                    font=("Consolas", 9),
                                                    state=tk.DISABLED)
@@ -1066,13 +1385,11 @@ class MailAttachmentTool:
         er1 = ttk.Frame(export_frame)
         er1.pack(fill=tk.X, pady=2)
         self.var_export_enabled = tk.BooleanVar(value=False)
-        ttk.Checkbutton(er1, text="启用定时导出",
-                        variable=self.var_export_enabled).pack(side=tk.LEFT)
+        ttk.Checkbutton(er1, text="启用定时导出", variable=self.var_export_enabled).pack(side=tk.LEFT)
         ttk.Label(er1, text="导出目录:").pack(side=tk.LEFT, padx=(15, 0))
         self.entry_export_folder = ttk.Entry(er1, width=28)
         self.entry_export_folder.pack(side=tk.LEFT, padx=3)
-        ttk.Button(er1, text="浏览...", command=self._browse_export_folder,
-                   width=7).pack(side=tk.LEFT)
+        ttk.Button(er1, text="浏览...", command=self._browse_export_folder, width=7).pack(side=tk.LEFT)
 
         er2 = ttk.Frame(export_frame)
         er2.pack(fill=tk.X, pady=2)
@@ -1084,16 +1401,13 @@ class MailAttachmentTool:
             ttk.Checkbutton(er2, text=name, variable=var).pack(side=tk.LEFT, padx=2)
         ttk.Label(er2, text="  时间: 时").pack(side=tk.LEFT, padx=(10, 0))
         self.spin_export_hour = ttk.Spinbox(er2, from_=0, to=23, width=4, justify=tk.CENTER)
-        self.spin_export_hour.pack(side=tk.LEFT, padx=(2, 3))
-        self.spin_export_hour.set("23")
+        self.spin_export_hour.pack(side=tk.LEFT, padx=(2, 3)); self.spin_export_hour.set("23")
         ttk.Label(er2, text="分").pack(side=tk.LEFT)
         self.spin_export_min = ttk.Spinbox(er2, from_=0, to=59, width=4, justify=tk.CENTER)
-        self.spin_export_min.pack(side=tk.LEFT, padx=(2, 3))
-        self.spin_export_min.set("59")
+        self.spin_export_min.pack(side=tk.LEFT, padx=(2, 3)); self.spin_export_min.set("59")
         ttk.Label(er2, text="秒").pack(side=tk.LEFT)
         self.spin_export_sec = ttk.Spinbox(er2, from_=0, to=59, width=4, justify=tk.CENTER)
-        self.spin_export_sec.pack(side=tk.LEFT, padx=(2, 3))
-        self.spin_export_sec.set("0")
+        self.spin_export_sec.pack(side=tk.LEFT, padx=(2, 3)); self.spin_export_sec.set("0")
 
         # --- 底部控制栏 ---
         bottom_frame = ttk.Frame(main_frame)
@@ -1102,12 +1416,57 @@ class MailAttachmentTool:
         self.status_label = ttk.Label(bottom_frame, text="状态: 未启动", foreground="gray")
         self.status_label.pack(side=tk.LEFT)
 
+        # 重试设置
+        self.var_retry_enabled = tk.BooleanVar(value=True)
+        ttk.Checkbutton(bottom_frame, text="失败自动重试", variable=self.var_retry_enabled).pack(side=tk.LEFT, padx=(15, 0))
+        ttk.Label(bottom_frame, text="重试次数:").pack(side=tk.LEFT, padx=(2, 0))
+        self.spin_retry_count = ttk.Spinbox(bottom_frame, from_=1, to=10, width=3, justify=tk.CENTER)
+        self.spin_retry_count.pack(side=tk.LEFT); self.spin_retry_count.set("3")
+        ttk.Label(bottom_frame, text="间隔(分):").pack(side=tk.LEFT, padx=(2, 0))
+        self.spin_retry_interval = ttk.Spinbox(bottom_frame, from_=1, to=60, width=3, justify=tk.CENTER)
+        self.spin_retry_interval.pack(side=tk.LEFT); self.spin_retry_interval.set("5")
+
+        # 配置导入导出
+        ttk.Button(bottom_frame, text="导出配置", command=self._export_config_btn, width=10).pack(side=tk.RIGHT, padx=3)
+        ttk.Button(bottom_frame, text="导入配置", command=self._import_config_btn, width=10).pack(side=tk.RIGHT, padx=3)
+        ttk.Separator(bottom_frame, orient=tk.VERTICAL).pack(side=tk.RIGHT, padx=5, fill=tk.Y)
+
         self.btn_start = ttk.Button(bottom_frame, text="启动定时任务",
                                      command=self._toggle_scheduler, width=16)
         self.btn_start.pack(side=tk.RIGHT, padx=5)
 
         ttk.Button(bottom_frame, text="全部应用配置", command=self._save_ui_config,
                    width=12).pack(side=tk.RIGHT, padx=5)
+
+        # 启动时渲染持久化日志
+        self._render_persisted_log()
+
+    # ---------- 时钟更新 (功能5) ----------
+    def _start_clock_update(self):
+        """每秒更新顶部时间显示"""
+        self._update_clock()
+
+    def _update_clock(self):
+        now = datetime.datetime.now()
+        self.time_label.config(text=f"当前时间: {now.strftime('%Y-%m-%d %H:%M:%S')}  {self.WEEKDAY_NAMES[now.weekday()]}")
+
+        # 显示下次执行时间
+        cfg = self.config
+        parts = []
+        if self.running:
+            dl = cfg.get("schedule_download", {})
+            if dl.get("enabled") and dl.get("days"):
+                dl_days = [self.WEEKDAY_NAMES[d-1] for d in dl["days"]]
+                parts.append(f"下次下载: {','.join(dl_days)} {dl['hour']:02d}:{dl['minute']:02d}:{dl['second']:02d}")
+            sd = cfg.get("schedule_send", {})
+            if sd.get("enabled") and sd.get("days"):
+                sd_days = [self.WEEKDAY_NAMES[d-1] for d in sd["days"]]
+                parts.append(f"下次发送: {','.join(sd_days)} {sd['hour']:02d}:{sd['minute']:02d}:{sd['second']:02d}")
+        else:
+            parts.append("定时任务未启动")
+        self.next_task_label.config(text=" | ".join(parts))
+
+        self.root.after(1000, self._update_clock)
 
     # ---------- 配置加载/保存 ----------
     def _load_config_to_ui(self):
@@ -1120,25 +1479,20 @@ class MailAttachmentTool:
         self.entry_user.insert(0, cfg.get("email_user", ""))
         self.entry_pass.delete(0, tk.END)
         self.entry_pass.insert(0, cfg.get("email_pass", ""))
-        # 发件人筛选（逗号分隔）
         filter_list = cfg.get("sender_filter_list", [])
-        # 兼容旧版单字符串
         if not filter_list and cfg.get("sender_filter"):
             filter_list = [cfg["sender_filter"]]
         self.entry_sender.delete(0, tk.END)
         self.entry_sender.insert(0, ", ".join(filter_list))
         self.entry_keyword.delete(0, tk.END)
         self.entry_keyword.insert(0, cfg.get("download_keyword_filter", ""))
-        # 已读/未读筛选
         rs = cfg.get("download_read_status", "all")
         rs_map = {"all": "全部邮件", "unseen": "仅未读", "seen": "仅已读"}
         self.combo_read_status.set(rs_map.get(rs, "全部邮件"))
         self.entry_folder.delete(0, tk.END)
         self.entry_folder.insert(0, cfg.get("save_folder", ""))
-
         self.var_skip_ssl.set(cfg.get("skip_ssl_verify", False))
 
-        # 下载定时
         dl = cfg.get("schedule_download", DEFAULT_CONFIG["schedule_download"])
         self.var_dl_enabled.set(dl.get("enabled", False))
         days = dl.get("days", [])
@@ -1148,7 +1502,6 @@ class MailAttachmentTool:
         self.spin_min.set(str(dl.get("minute", 0)))
         self.spin_sec.set(str(dl.get("second", 0)))
 
-        # 邮件筛选
         filter_days = cfg.get("download_filter_days", [])
         for i in range(7):
             self.dl_email_day_vars[i].set((i + 1) in filter_days)
@@ -1183,7 +1536,6 @@ class MailAttachmentTool:
         self.text_send_body.delete(1.0, tk.END)
         self.text_send_body.insert(1.0, cfg.get("send_body", ""))
         self.entry_send_attachment.delete(0, tk.END)
-        # 加载附件模式
         att_mode = cfg.get("send_attachment_mode", "single")
         self.var_att_mode.set(att_mode)
         if att_mode == "single":
@@ -1195,7 +1547,6 @@ class MailAttachmentTool:
             if paths:
                 self.entry_send_attachment.insert(0, "; ".join(paths))
 
-        # 发送定时
         sd = cfg.get("schedule_send", DEFAULT_CONFIG["schedule_send"])
         self.var_sd_enabled.set(sd.get("enabled", False))
         send_days = sd.get("days", [])
@@ -1205,7 +1556,7 @@ class MailAttachmentTool:
         self.spin_send_min.set(str(sd.get("minute", 0)))
         self.spin_send_sec.set(str(sd.get("second", 0)))
 
-        # 日志导出定时
+        # 日志导出
         self.var_export_enabled.set(cfg.get("log_export_enabled", False))
         self.entry_export_folder.delete(0, tk.END)
         self.entry_export_folder.insert(0, cfg.get("log_export_folder", ""))
@@ -1216,6 +1567,11 @@ class MailAttachmentTool:
         self.spin_export_min.set(str(cfg.get("log_export_minute", 59)))
         self.spin_export_sec.set(str(cfg.get("log_export_second", 0)))
 
+        # 重试设置
+        self.var_retry_enabled.set(cfg.get("retry_enabled", True))
+        self.spin_retry_count.set(str(cfg.get("retry_count", 3)))
+        self.spin_retry_interval.set(str(cfg.get("retry_interval_minutes", 5)))
+
     def _save_ui_config(self):
         try:
             dl_days = [i + 1 for i, var in enumerate(self.day_vars) if var.get()]
@@ -1223,12 +1579,11 @@ class MailAttachmentTool:
             exp_days = [i + 1 for i, var in enumerate(self.export_day_vars) if var.get()]
 
             cfg = {
-                # 下载配置
                 "imap_server": self.entry_server.get().strip(),
                 "imap_port": int(self.entry_port.get().strip()),
                 "email_user": self.entry_user.get().strip(),
                 "email_pass": self.entry_pass.get().strip(),
-                "sender_filter": "",  # 旧版兼容
+                "sender_filter": "",
                 "sender_filter_list": [
                     s.strip() for s in self.entry_sender.get().split(",") if s.strip()
                 ],
@@ -1250,7 +1605,6 @@ class MailAttachmentTool:
                 "download_filter_date_enabled": self.var_dl_email_date.get(),
                 "download_filter_date_start": self.entry_dl_email_date1.get().strip(),
                 "download_filter_date_end": self.entry_dl_email_date2.get().strip(),
-                # 发送配置
                 "smtp_server": self.entry_smtp_server.get().strip(),
                 "smtp_port": int(self.entry_smtp_port.get().strip()),
                 "smtp_ssl": self.var_smtp_ssl.get(),
@@ -1270,13 +1624,15 @@ class MailAttachmentTool:
                     "second": int(self.spin_send_sec.get()),
                     "enabled": self.var_sd_enabled.get()
                 },
-                # 日志导出
                 "log_export_enabled": self.var_export_enabled.get(),
                 "log_export_folder": self.entry_export_folder.get().strip(),
                 "log_export_days": exp_days,
                 "log_export_hour": int(self.spin_export_hour.get()),
                 "log_export_minute": int(self.spin_export_min.get()),
                 "log_export_second": int(self.spin_export_sec.get()),
+                "retry_enabled": self.var_retry_enabled.get(),
+                "retry_count": int(self.spin_retry_count.get()),
+                "retry_interval_minutes": int(self.spin_retry_interval.get()),
             }
             save_config(cfg)
             self.config = cfg
@@ -1284,9 +1640,7 @@ class MailAttachmentTool:
         except ValueError:
             messagebox.showerror("错误", "端口/时间必须是数字")
 
-    # ---------- 独立保存/清除 ----------
     def _save_download_config(self):
-        """仅保存下载页配置"""
         dl_days = [i + 1 for i, var in enumerate(self.day_vars) if var.get()]
         self.config.update({
             "imap_server": self.entry_server.get().strip(),
@@ -1317,10 +1671,9 @@ class MailAttachmentTool:
             "download_filter_date_end": self.entry_dl_email_date2.get().strip(),
         })
         save_config(self.config)
-        self.log("下载配置已保存")
+        self.log("下载配置已保存", "download")
 
     def _clear_download_config(self):
-        """清除下载页所有配置"""
         self.entry_server.delete(0, tk.END)
         self.entry_port.delete(0, tk.END); self.entry_port.insert(0, "993")
         self.entry_user.delete(0, tk.END)
@@ -1334,7 +1687,6 @@ class MailAttachmentTool:
         for var in self.day_vars:
             var.set(False)
         self.spin_hour.set("9"); self.spin_min.set("0"); self.spin_sec.set("0")
-        # 清除邮件筛选
         for var in self.dl_email_day_vars:
             var.set(False)
         self.var_dl_email_time.set(False)
@@ -1344,10 +1696,9 @@ class MailAttachmentTool:
         self.entry_dl_email_date1.delete(0, tk.END)
         self.entry_dl_email_date2.delete(0, tk.END)
         self._save_download_config()
-        self.log("下载配置已清除")
+        self.log("下载配置已清除", "download")
 
     def _save_send_config(self):
-        """仅保存发送页配置"""
         sd_days = [i + 1 for i, var in enumerate(self.send_day_vars) if var.get()]
         self.config.update({
             "smtp_server": self.entry_smtp_server.get().strip(),
@@ -1371,10 +1722,9 @@ class MailAttachmentTool:
             }
         })
         save_config(self.config)
-        self.log("发送配置已保存")
+        self.log("发送配置已保存", "send")
 
     def _clear_send_config(self):
-        """清除发送页所有配置"""
         self.entry_smtp_server.delete(0, tk.END)
         self.entry_smtp_port.delete(0, tk.END); self.entry_smtp_port.insert(0, "465")
         self.var_smtp_ssl.set(True)
@@ -1391,7 +1741,7 @@ class MailAttachmentTool:
             var.set(False)
         self.spin_send_hour.set("8"); self.spin_send_min.set("0"); self.spin_send_sec.set("0")
         self._save_send_config()
-        self.log("发送配置已清除")
+        self.log("发送配置已清除", "send")
 
     def _browse_folder(self):
         path = filedialog.askdirectory(title="选择附件保存目录")
@@ -1400,7 +1750,6 @@ class MailAttachmentTool:
             self.entry_folder.insert(0, path)
 
     def _browse_send_att(self):
-        """根据附件模式浏览选择文件/文件夹"""
         mode = self.var_att_mode.get()
         if mode == "single":
             path = filedialog.askopenfilename(title="选择要发送的附件文件")
@@ -1419,14 +1768,12 @@ class MailAttachmentTool:
                 self.entry_send_attachment.insert(0, path)
 
     def _get_attachment_list_from_ui(self):
-        """从UI输入框解析附件路径列表"""
         text = self.entry_send_attachment.get().strip()
         if not text:
             return []
         return [p.strip() for p in text.split(";") if p.strip()]
 
     def _resolve_attachment_paths(self, cfg):
-        """根据配置解析最终要发送的附件文件路径列表"""
         mode = cfg.get("send_attachment_mode", "single")
         if mode == "single":
             path = cfg.get("send_attachment", "")
@@ -1447,15 +1794,51 @@ class MailAttachmentTool:
         return []
 
     def _format_subject(self, subject):
-        """替换主题中的日期占位符 YYYY → 年, MM → 月(去0), DD → 日(去0)"""
         now = datetime.datetime.now()
         return subject.replace("YYYY", str(now.year)).replace("MM", str(now.month)).replace("DD", str(now.day))
 
+    # ---------- 测试连接 (建议D) ----------
+    def _test_imap_btn(self):
+        """测试IMAP连接"""
+        self._save_download_config()
+        cfg = self.config
+        if not cfg["email_user"] or not cfg["email_pass"]:
+            messagebox.showerror("错误", "请先填写邮箱账号和密码/授权码")
+            return
+        try:
+            self.log("正在测试IMAP连接...", "download")
+            test_imap_connection(cfg["imap_server"], cfg["imap_port"],
+                                cfg["email_user"], cfg["email_pass"],
+                                cfg.get("skip_ssl_verify", False))
+            self.log("IMAP连接测试成功！", "download")
+            messagebox.showinfo("连接成功", "IMAP服务器连接成功！")
+        except Exception as e:
+            self.log(f"IMAP连接测试失败: {e}", "download")
+            messagebox.showerror("连接失败", f"IMAP连接失败:\n{e}")
+
+    def _test_smtp_btn(self):
+        """测试SMTP连接"""
+        self._save_send_config()
+        cfg = self.config
+        send_user = cfg.get("send_user") or cfg.get("email_user")
+        send_pass = cfg.get("send_pass") or cfg.get("email_pass")
+        if not send_user or not send_pass:
+            messagebox.showerror("错误", "请填写发件人账号和密码")
+            return
+        try:
+            self.log("正在测试SMTP连接...", "send")
+            test_smtp_connection(cfg["smtp_server"], cfg["smtp_port"],
+                                 cfg["smtp_ssl"], send_user, send_pass,
+                                 cfg.get("skip_ssl_smtp", False))
+            self.log("SMTP连接测试成功！", "send")
+            messagebox.showinfo("连接成功", "SMTP服务器连接成功！")
+        except Exception as e:
+            self.log(f"SMTP连接测试失败: {e}", "send")
+            messagebox.showerror("连接失败", f"SMTP连接失败:\n{e}")
+
     # ---------- 核心操作 ----------
     def _test_and_run(self):
-        """测试连接并立即执行一次下载"""
         self._save_ui_config()
-
         cfg = self.config
         if not cfg["email_user"] or not cfg["email_pass"]:
             messagebox.showerror("错误", "请先填写邮箱账号和密码/授权码")
@@ -1502,7 +1885,6 @@ class MailAttachmentTool:
             self.log(f"本次下载了 {count} 个附件", "download")
             if count == 0:
                 self.log("没有新的匹配附件", "download")
-
         except imaplib.IMAP4.error as e:
             self.log(f"IMAP错误: {e}", "download")
             messagebox.showerror("连接失败",
@@ -1514,11 +1896,8 @@ class MailAttachmentTool:
         self.log("=" * 50, "download")
 
     def _test_send(self):
-        """立即发送一封邮件（测试）"""
         self._save_ui_config()
         cfg = self.config
-
-        # 发件人账号优先用发送页的，空则复用下载页的
         send_user = cfg.get("send_user") or cfg["email_user"]
         send_pass = cfg.get("send_pass") or cfg["email_pass"]
 
@@ -1542,7 +1921,8 @@ class MailAttachmentTool:
                 cfg["send_to"], formatted_subject,
                 cfg.get("send_body", ""), att_paths,
                 cfg.get("skip_ssl_smtp", False),
-                lambda msg: self.log(msg, "send")
+                lambda msg: self.log(msg, "send"),
+                config=cfg
             )
             self.log("发送成功！", "send")
         except smtplib.SMTPAuthenticationError:
@@ -1553,6 +1933,179 @@ class MailAttachmentTool:
             messagebox.showerror("发送出错", str(e))
 
         self.log("=" * 50, "send")
+
+    # ---------- 邮件查询 (功能3) ----------
+    def _do_mail_query(self):
+        """执行邮件查询"""
+        self._save_download_config()
+        cfg = self.config
+        if not cfg["email_user"] or not cfg["email_pass"]:
+            messagebox.showerror("错误", "请先在下载配置页填写IMAP邮箱账号和密码")
+            return
+
+        keyword = self.entry_query_keyword.get().strip()
+        max_count = int(self.spin_query_count.get())
+        folder = self.combo_query_folder.get()
+
+        self.log(f"正在查询 {folder}...", "query")
+
+        try:
+            mail = connect_imap(cfg["imap_server"], cfg["imap_port"],
+                                cfg["email_user"], cfg["email_pass"],
+                                cfg.get("skip_ssl_verify", False))
+
+            # 关键词不再走 IMAP 搜索（OR 运算符国产邮箱兼容性差），
+            # 改为 Python 侧过滤，IMAP 仅负责日期范围
+            criteria = "ALL"
+
+            if folder == "已发送":
+                # 自动检测已发送文件夹名
+                sent_folder = get_sent_folder_name(mail, log_func=lambda msg: self.log(msg, "query"))
+                if sent_folder:
+                    folder = sent_folder
+                    self.log(f"检测到已发送文件夹: {sent_folder}", "query")
+                else:
+                    self.log("未找到已发送文件夹", "query")
+                    mail.logout()
+                    messagebox.showwarning("提示", "未找到已发送文件夹")
+                    return
+
+            emails = query_emails(mail, folder, criteria, max_count=max_count,
+                                 log_func=lambda msg: self.log(msg, "query"),
+                                 start_date=self.entry_query_start_date.get().strip() or None,
+                                 end_date=self.entry_query_end_date.get().strip() or None)
+            mail.logout()
+
+            # 关键词本地过滤（IMAP OR 语法国产邮箱兼容性差，中文编码也有问题）
+            if keyword:
+                kw = keyword.lower()
+                emails = [e for e in emails if kw in (e.get("subject") or "").lower() or kw in (e.get("from") or "").lower()]
+
+            # 清除旧列表
+            for item in self.mail_tree.get_children():
+                self.mail_tree.delete(item)
+
+            self.query_detail_data = None
+            self.mail_detail_text.config(state=tk.NORMAL)
+            self.mail_detail_text.delete(1.0, tk.END)
+            self.mail_detail_text.config(state=tk.DISABLED)
+
+            for em in emails:
+                person = em["from"] if folder != "已发送" else em["to"]
+                self.mail_tree.insert("", tk.END, values=(person, em["subject"], em["date"]), iid=em["id"])
+
+            self.log(f"查询完成，共 {len(emails)} 封邮件", "query")
+        except Exception as e:
+            self.log(f"查询失败: {e}", "query")
+            messagebox.showerror("查询失败", str(e))
+
+        self.log("=" * 50, "query")
+
+    def _on_mail_select(self, event):
+        """选中邮件时显示详情"""
+        selection = self.mail_tree.selection()
+        if not selection:
+            return
+        mail_id = selection[0]
+
+        self.mail_detail_text.config(state=tk.NORMAL)
+        self.mail_detail_text.delete(1.0, tk.END)
+        self.mail_detail_text.insert(tk.END, "正在加载邮件详情...")
+        self.mail_detail_text.config(state=tk.DISABLED)
+
+        # 后台线程获取详情
+        threading.Thread(target=self._fetch_mail_detail_thread, args=(mail_id,), daemon=True).start()
+
+    def _fetch_mail_detail_thread(self, mail_id):
+        """后台线程获取邮件详情"""
+        cfg = self.config
+        try:
+            mail = connect_imap(cfg["imap_server"], cfg["imap_port"],
+                                cfg["email_user"], cfg["email_pass"],
+                                cfg.get("skip_ssl_verify", False))
+
+            # 获取当前查询选中的文件夹
+            folder = self.combo_query_folder.get()
+            if folder == "已发送":
+                sent_folder = get_sent_folder_name(mail)
+                folder = sent_folder or "INBOX"
+            elif folder != "INBOX":
+                folder = "INBOX"
+
+            # 必须先 select 进入 SELECTED 状态才能 FETCH
+            if " " in folder or "/" in folder or any(ord(c) > 127 for c in folder):
+                select_name = f'"{folder}"'
+            else:
+                select_name = folder
+            try:
+                mail.select(select_name)
+            except Exception:
+                mail.select(folder)
+
+            detail = fetch_email_detail(mail, mail_id)
+            mail.logout()
+
+            self.root.after(0, lambda: self._show_mail_detail(detail))
+        except Exception as e:
+            self.root.after(0, lambda: self._show_mail_detail_error(str(e)))
+
+    def _show_mail_detail(self, detail):
+        """显示邮件详情"""
+        self.mail_detail_text.config(state=tk.NORMAL)
+        self.mail_detail_text.delete(1.0, tk.END)
+        if detail:
+            self.query_detail_data = detail
+            text = f"发件人: {detail['from']}\n"
+            text += f"收件人: {detail['to']}\n"
+            if detail.get('cc'):
+                text += f"抄送: {detail['cc']}\n"
+            text += f"主题: {detail['subject']}\n"
+            text += f"日期: {detail['date']}\n"
+            text += f"{'─' * 40}\n"
+            if detail.get('body'):
+                text += detail['body']
+            else:
+                text += "(无文本正文，可能为HTML格式)"
+            text += f"\n{'─' * 40}\n"
+            if detail.get('attachments'):
+                text += f"附件 ({len(detail['attachments'])} 个):\n"
+                for att in detail['attachments']:
+                    text += f"  - {att['filename']} ({att['size']} 字节)\n"
+            else:
+                text += "无附件"
+            self.mail_detail_text.insert(tk.END, text)
+        else:
+            self.mail_detail_text.insert(tk.END, "无法获取邮件详情")
+        self.mail_detail_text.config(state=tk.DISABLED)
+
+    def _show_mail_detail_error(self, error):
+        self.mail_detail_text.config(state=tk.NORMAL)
+        self.mail_detail_text.delete(1.0, tk.END)
+        self.mail_detail_text.insert(tk.END, f"加载失败: {error}")
+        self.mail_detail_text.config(state=tk.DISABLED)
+
+    def _download_query_attachment(self):
+        """下载查询邮件中的附件"""
+        if not self.query_detail_data or not self.query_detail_data.get("attachments"):
+            messagebox.showinfo("提示", "此邮件无附件")
+            return
+        folder = filedialog.askdirectory(title="选择附件保存目录")
+        if not folder:
+            return
+        count = 0
+        for att in self.query_detail_data["attachments"]:
+            filename = clean_filename(att["filename"])
+            filepath = os.path.join(folder, filename)
+            if os.path.exists(filepath):
+                base, ext = os.path.splitext(filename)
+                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                filepath = os.path.join(folder, f"{base}_{ts}{ext}")
+            with open(filepath, "wb") as f:
+                f.write(att["payload"])
+            self.log(f"已下载附件: {filename}", "query")
+            count += 1
+        messagebox.showinfo("下载完成", f"成功下载 {count} 个附件到:\n{folder}")
+        self.log(f"本次下载了 {count} 个附件", "query")
 
     # ---------- 定时调度 ----------
     def _toggle_scheduler(self):
@@ -1572,7 +2125,21 @@ class MailAttachmentTool:
             messagebox.showerror("错误", "请至少启用一个定时任务（下载或发送）")
             return
 
-        # 下载校验
+        # 建议E：检查是否勾选了星期几
+        warnings = []
+        if dl_enabled:
+            dl_days = cfg["schedule_download"]["days"]
+            if not dl_days:
+                warnings.append("下载定时任务已启用但未勾选任何执行日期，任务永远不会触发")
+        if sd_enabled:
+            sd_days = cfg["schedule_send"]["days"]
+            if not sd_days:
+                warnings.append("发送定时任务已启用但未勾选任何执行日期，任务永远不会触发")
+        if warnings:
+            warn_msg = "\n".join(warnings)
+            if not messagebox.askyesno("警告", warn_msg + "\n\n仍然启动？"):
+                return
+
         if dl_enabled:
             if not cfg.get("email_user") or not cfg.get("email_pass"):
                 messagebox.showerror("错误", "下载任务已启用，请填写邮箱账号和密码")
@@ -1587,7 +2154,6 @@ class MailAttachmentTool:
                 return
             os.makedirs(cfg["save_folder"], exist_ok=True)
 
-        # 发送校验
         if sd_enabled:
             send_user = cfg.get("send_user") or cfg.get("email_user")
             send_pass = cfg.get("send_pass") or cfg.get("email_pass")
@@ -1602,6 +2168,7 @@ class MailAttachmentTool:
         self.stop_event.clear()
         self.btn_start.config(text="停止定时任务")
         self.status_label.config(text="状态: 运行中", foreground="green")
+        self.retry_state = {}
 
         self.log("=" * 50)
         self.log("定时任务已启动")
@@ -1619,6 +2186,8 @@ class MailAttachmentTool:
             if ed:
                 dn = [self.WEEKDAY_NAMES[d - 1] for d in ed]
                 self.log(f"  [日志导出] {', '.join(dn)} {cfg.get('log_export_hour',23):02d}:{cfg.get('log_export_minute',59):02d}:{cfg.get('log_export_second',0):02d}")
+        if cfg.get("retry_enabled"):
+            self.log(f"  [重试] 启用，最多{cfg.get('retry_count',3)}次，间隔{cfg.get('retry_interval_minutes',5)}分钟")
         self.log("=" * 50)
 
         self.scheduler_thread = threading.Thread(target=self._scheduler_loop, daemon=True)
@@ -1632,9 +2201,7 @@ class MailAttachmentTool:
         self.log("定时任务已停止")
 
     def _scheduler_loop(self):
-        """调度循环，同时检查下载和发送两个定时任务"""
         cfg = self.config
-
         last_dl_date = None
         last_sd_date = None
         last_export_date = None
@@ -1677,10 +2244,38 @@ class MailAttachmentTool:
                 last_export_date = today
                 self.root.after(0, self._auto_export_log)
 
+            # --- 重试检查 (建议C) ---
+            if cfg.get("retry_enabled"):
+                self._check_retry()
+
             time.sleep(0.5)
 
+    def _check_retry(self):
+        """检查是否有待重试的任务"""
+        cfg = self.config
+        now = time.time()
+        for task_type in list(self.retry_state.keys()):
+            state = self.retry_state[task_type]
+            if state["fail_count"] >= cfg.get("retry_count", 3):
+                # 超过重试次数，放弃
+                del self.retry_state[task_type]
+                continue
+            elapsed = (now - state["last_fail"]) / 60.0
+            if elapsed >= cfg.get("retry_interval_minutes", 5):
+                self.retry_state[task_type]["last_fail"] = now
+                self.root.after(0, lambda t=task_type: self._retry_task(t))
+
+    def _retry_task(self, task_type):
+        """执行重试任务"""
+        state = self.retry_state.get(task_type, {})
+        fail_count = state.get("fail_count", 0)
+        self.log(f"正在重试{task_type}任务 (第{fail_count}次失败后)...", task_type)
+        if task_type == "download":
+            self._execute_download()
+        elif task_type == "send":
+            self._execute_send()
+
     def _execute_download(self):
-        """在UI线程中执行下载"""
         cfg = self.config
         self.log("=" * 50, "download")
         self.log(f"定时任务触发，开始下载...", "download")
@@ -1713,13 +2308,22 @@ class MailAttachmentTool:
             self.log(f"本次下载了 {count} 个附件", "download")
             if count == 0:
                 self.log("没有新的匹配附件", "download")
+            # 成功后清除重试状态
+            self.retry_state.pop("download", None)
         except Exception as e:
-            self.log(f"执行出错: {e}", "download")
+            error_msg = f"下载任务执行出错: {e}"
+            self.log(error_msg, "download")
+            self._handle_task_error("download", error_msg)
+            # 记录重试状态
+            if "download" not in self.retry_state:
+                self.retry_state["download"] = {"fail_count": 0, "last_fail": time.time()}
+            else:
+                self.retry_state["download"]["fail_count"] += 1
+                self.retry_state["download"]["last_fail"] = time.time()
 
         self.log("=" * 50, "download")
 
     def _execute_send(self):
-        """在UI线程中执行发送"""
         cfg = self.config
         self.log("=" * 50, "send")
         self.log(f"定时发送触发...", "send")
@@ -1737,24 +2341,62 @@ class MailAttachmentTool:
                 cfg["send_to"], formatted_subject,
                 cfg.get("send_body", ""), att_paths,
                 cfg.get("skip_ssl_smtp", False),
-                lambda msg: self.log(msg, "send")
+                lambda msg: self.log(msg, "send"),
+                config=cfg
             )
             self.log("发送成功！", "send")
+            self.retry_state.pop("send", None)
         except Exception as e:
-            self.log(f"发送出错: {e}", "send")
+            error_msg = f"发送任务执行出错: {e}"
+            self.log(error_msg, "send")
+            self._handle_task_error("send", error_msg)
+            if "send" not in self.retry_state:
+                self.retry_state["send"] = {"fail_count": 0, "last_fail": time.time()}
+            else:
+                self.retry_state["send"]["fail_count"] += 1
+                self.retry_state["send"]["last_fail"] = time.time()
 
         self.log("=" * 50, "send")
 
-    # ---------- 日志（支持分类,筛选,导出） ----------
-    LOG_CATEGORIES = {"download": "[下载]", "send": "[发送]", "system": "[系统]"}
+    # ---------- 失败告警 (功能4) ----------
+    def _handle_task_error(self, task_type, error_msg):
+        """弹出失败告警弹窗 + 托盘通知"""
+        error_key = f"{task_type}_{error_msg[:50]}"
+        now = time.time()
+
+        # 去重：同一类错误5分钟内只弹一次
+        if error_key in self.last_error_time:
+            if now - self.last_error_time[error_key] < 300:
+                return
+        self.last_error_time[error_key] = now
+
+        # UI弹窗
+        self.root.after(100, lambda: messagebox.showerror(
+            f"定时任务失败 - {task_type}",
+            f"{task_type}任务执行失败，请检查运行日志。\n\n错误信息: {error_msg[:200]}"
+        ))
+
+        # 托盘气泡通知
+        if self.tray_icon:
+            try:
+                self.tray_icon.notify(
+                    f"【邮件工具】{task_type}任务失败",
+                    f" {error_msg[:100]}"
+                )
+            except Exception:
+                pass
+
+    # ---------- 日志（支持分类,筛选,导出,持久化） ----------
+    LOG_CATEGORIES = {"download": "[下载]", "send": "[发送]", "system": "[系统]", "query": "[查询]"}
 
     def log(self, msg, cat="system"):
-        """记录日志，cat: download / send / system"""
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         prefix = self.LOG_CATEGORIES.get(cat, "[系统]")
         full = f"{prefix} {ts}  {msg}" if cat != "system" else msg
         self.log_entries.append({"time": ts, "cat": cat, "msg": msg})
         self._render_log(full)
+        # 持久化日志 (建议F)
+        persist_log_entries(self.log_entries)
 
     def _render_log(self, line):
         self.log_text.config(state=tk.NORMAL)
@@ -1762,14 +2404,23 @@ class MailAttachmentTool:
         self.log_text.see(tk.END)
         self.log_text.config(state=tk.DISABLED)
 
+    def _render_persisted_log(self):
+        """启动时渲染已持久化的日志"""
+        for entry in self.log_entries:
+            ts = entry["time"]
+            prefix = self.LOG_CATEGORIES.get(entry["cat"], "[系统]")
+            line = f"{prefix} {ts}  {entry['msg']}" if entry["cat"] != "system" else entry["msg"]
+            self._render_log(line)
+
     def _clear_log(self):
         self.log_text.config(state=tk.NORMAL)
         self.log_text.delete(1.0, tk.END)
         self.log_text.config(state=tk.DISABLED)
         self.log_entries.clear()
+        # 同时清空持久化文件
+        persist_log_entries([])
 
     def _apply_log_filter(self, category):
-        """筛选日志显示"""
         self.log_filter = category
         self.log_text.config(state=tk.NORMAL)
         self.log_text.delete(1.0, tk.END)
@@ -1782,7 +2433,6 @@ class MailAttachmentTool:
                 self._render_log(line)
 
     def _export_log(self):
-        """导出日志到文件（当前筛选或全部）"""
         entries = self.log_entries
         if self.log_filter != "all":
             entries = [e for e in self.log_entries if e["cat"] == self.log_filter]
@@ -1806,7 +2456,6 @@ class MailAttachmentTool:
         messagebox.showinfo("导出完成", f"日志已保存到:\n{path}")
 
     def _auto_export_log(self):
-        """定时自动导出全部日志"""
         cfg = self.config
         folder = cfg.get("log_export_folder", "")
         if not folder:
@@ -1828,23 +2477,56 @@ class MailAttachmentTool:
             self.entry_export_folder.delete(0, tk.END)
             self.entry_export_folder.insert(0, folder)
 
+    # ---------- 配置导入导出 (建议G) ----------
+    def _export_config_btn(self):
+        """导出配置到文件"""
+        self._save_ui_config()
+        path = filedialog.asksaveasfilename(
+            title="导出配置文件", defaultextension=".json",
+            filetypes=[("JSON文件", "*.json"), ("所有文件", "*.*")],
+            initialfile=f"邮件工具配置_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        )
+        if not path:
+            return
+        try:
+            export_config_to(self.config, path)
+            self.log(f"配置已导出 -> {path}")
+            messagebox.showinfo("导出成功", f"配置已导出到:\n{path}")
+        except Exception as e:
+            messagebox.showerror("导出失败", str(e))
+
+    def _import_config_btn(self):
+        """从文件导入配置"""
+        path = filedialog.askopenfilename(
+            title="导入配置文件",
+            filetypes=[("JSON文件", "*.json"), ("所有文件", "*.*")]
+        )
+        if not path:
+            return
+        if not messagebox.askyesno("确认导入", "导入配置将覆盖当前设置，是否继续？"):
+            return
+        try:
+            new_config = import_config_from(path)
+            self.config = new_config
+            save_config(self.config)
+            self._load_config_to_ui()
+            self.log(f"配置已导入 -> {path}")
+            messagebox.showinfo("导入成功", f"配置已从文件导入，请检查各项设置。")
+        except Exception as e:
+            messagebox.showerror("导入失败", f"无法读取配置文件:\n{e}")
+
     # ---------- 系统托盘 ----------
     def _create_tray_image(self):
-        """生成托盘图标（信封图案）"""
         img = Image.new("RGB", (64, 64), (0, 120, 212))
         draw = ImageDraw.Draw(img)
-        # 信封主体
         draw.rectangle([8, 18, 56, 46], fill="white", outline="white")
-        # 信封三角折角
         draw.polygon([(8, 18), (32, 32), (56, 18)], fill=(0, 120, 212))
         draw.polygon([(8, 46), (32, 32), (56, 46)], fill="white")
-        # @符号
         draw.ellipse([20, 22, 44, 42], outline=(0, 120, 212), width=2)
         draw.text((24, 26), "M", fill=(0, 120, 212))
         return img
 
     def _show_window(self, icon=None):
-        """显示主窗口"""
         self.root.after(0, self._restore_window)
 
     def _restore_window(self):
@@ -1853,13 +2535,12 @@ class MailAttachmentTool:
         self.root.focus_force()
 
     def _hide_to_tray(self):
-        """最小化到托盘"""
         self.root.withdraw()
         if self.tray_icon is None:
             self.tray_icon = pystray.Icon(
                 "mail_tool",
                 self._create_tray_image(),
-                "邮件自动化工具",
+                "邮件自动化工具HK",
                 menu=pystray.Menu(
                     pystray.MenuItem("显示窗口", self._show_window, default=True),
                     pystray.MenuItem("退出程序", self._tray_exit)
@@ -1868,16 +2549,16 @@ class MailAttachmentTool:
             threading.Thread(target=self.tray_icon.run, daemon=True).start()
 
     def _tray_exit(self, icon=None):
-        """从托盘退出程序"""
         if self.tray_icon:
             self.tray_icon.stop()
         if self.running:
             self._stop_scheduler()
+        # 退出前持久化日志
+        persist_log_entries(self.log_entries)
         self.root.after(0, self.root.destroy)
 
     # ---------- 关闭 ----------
     def on_close(self):
-        """关闭窗口 → 最小化到托盘"""
         self.log(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 窗口已最小化到系统托盘，程序在后台运行中")
         self._hide_to_tray()
 
