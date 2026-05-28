@@ -1039,9 +1039,10 @@ def query_emails(mail, folder, search_criteria, max_count=50, log_func=None,
         for response_part in msg_data:
             if isinstance(response_part, tuple):
                 raw_bytes = response_part[1]
+                if isinstance(response_part[0], bytes) and b'\\Seen' in response_part[0]:
+                    seen = True
             elif isinstance(response_part, bytes):
-                flags_str = response_part.decode('ascii', errors='replace')
-                if '\\Seen' in flags_str:
+                if b'\\Seen' in response_part:
                     seen = True
         if raw_bytes is None:
             continue
@@ -1074,9 +1075,10 @@ def fetch_email_detail(mail, mail_id, log_func=None):
     for response_part in msg_data:
         if isinstance(response_part, tuple):
             raw_email_bytes = response_part[1]
+            if isinstance(response_part[0], bytes) and b'\\Seen' in response_part[0]:
+                seen = True
         elif isinstance(response_part, bytes):
-            flags_str = response_part.decode('ascii', errors='replace')
-            if '\\Seen' in flags_str:
+            if b'\\Seen' in response_part:
                 seen = True
     if raw_email_bytes is None:
         return None
@@ -1530,6 +1532,8 @@ class MailAttachmentTool:
         self.btn_query_mail.pack(side=tk.LEFT, padx=3)
         self.btn_refresh_mail = ttk.Button(query_ctrl1, text="刷新列表", command=self._do_mail_query, width=8)
         self.btn_refresh_mail.pack(side=tk.LEFT, padx=3)
+        self.btn_sent_mail = ttk.Button(query_ctrl1, text="查看已发送", command=self._do_sent_mail_query, width=10)
+        self.btn_sent_mail.pack(side=tk.LEFT, padx=3)
 
         # 查询控制栏 — 第二行：日期范围 + 数量
         query_ctrl2 = ttk.Frame(tab_query)
@@ -2201,6 +2205,7 @@ class MailAttachmentTool:
         self.querying = True
         self.btn_query_mail.config(state=tk.DISABLED, text="查询中...")
         self.btn_refresh_mail.config(state=tk.DISABLED, text="查询中...")
+        self.btn_sent_mail.config(state=tk.DISABLED, text="查询中...")
 
         # 清除旧列表，显示加载提示
         for item in self.mail_tree.get_children():
@@ -2216,13 +2221,21 @@ class MailAttachmentTool:
         # 在后台线程执行 IMAP 操作
         def _query_worker():
             try:
+                imap_user = cfg["email_user"]
+                imap_pass = cfg["email_pass"]
+                actual_folder = folder
+                if folder == "已发送":
+                    sent_user = cfg.get("send_user") or cfg["email_user"]
+                    sent_pass = cfg.get("send_pass") or cfg["email_pass"]
+                    imap_user = sent_user
+                    imap_pass = sent_pass
+
                 mail = connect_imap(cfg["imap_server"], cfg["imap_port"],
-                                    cfg["email_user"], cfg["email_pass"],
+                                    imap_user, imap_pass,
                                     cfg.get("skip_ssl_verify", False))
 
                 criteria = "ALL"
 
-                actual_folder = folder
                 if folder == "已发送":
                     sent_folder = get_sent_folder_name(mail, log_func=lambda msg: self.root.after(0, lambda: self.log(msg, "query")))
                     if sent_folder:
@@ -2257,6 +2270,7 @@ class MailAttachmentTool:
         self.querying = False
         self.btn_query_mail.config(state=tk.NORMAL, text="查询")
         self.btn_refresh_mail.config(state=tk.NORMAL, text="刷新列表")
+        self.btn_sent_mail.config(state=tk.NORMAL, text="查看已发送")
 
         # 清除旧详情
         self.mail_detail_text.config(state=tk.NORMAL)
@@ -2279,6 +2293,7 @@ class MailAttachmentTool:
         self.querying = False
         self.btn_query_mail.config(state=tk.NORMAL, text="查询")
         self.btn_refresh_mail.config(state=tk.NORMAL, text="刷新列表")
+        self.btn_sent_mail.config(state=tk.NORMAL, text="查看已发送")
 
         self.mail_detail_text.config(state=tk.NORMAL)
         self.mail_detail_text.delete(1.0, tk.END)
@@ -2290,6 +2305,12 @@ class MailAttachmentTool:
 
         if "未找到已发送文件夹" not in error_msg:
             messagebox.showerror("查询失败", error_msg)
+
+    def _do_sent_mail_query(self):
+        """快捷查看已发送邮件"""
+        self.combo_query_folder.set("已发送")
+        self.combo_read_filter.set("全部")
+        self._do_mail_query()
 
     def _on_mail_select(self, event):
         """选中邮件时显示详情"""
@@ -2311,12 +2332,19 @@ class MailAttachmentTool:
         """后台线程获取邮件详情"""
         cfg = self.config
         try:
+            imap_user = cfg["email_user"]
+            imap_pass = cfg["email_pass"]
+            folder = query_folder
+            if folder == "已发送":
+                sent_user = cfg.get("send_user") or cfg["email_user"]
+                sent_pass = cfg.get("send_pass") or cfg["email_pass"]
+                imap_user = sent_user
+                imap_pass = sent_pass
+
             mail = connect_imap(cfg["imap_server"], cfg["imap_port"],
-                                cfg["email_user"], cfg["email_pass"],
+                                imap_user, imap_pass,
                                 cfg.get("skip_ssl_verify", False))
 
-            # 获取当前查询选中的文件夹（由调用方传入，避免线程内调用 Tkinter）
-            folder = query_folder
             if folder == "已发送":
                 sent_folder = get_sent_folder_name(mail)
                 folder = sent_folder or "INBOX"
