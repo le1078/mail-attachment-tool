@@ -6,4 +6,6 @@ dist/
 *.spec
 *.exe
 config.json
+config_backups/
+*.log
 processed_ids.txt

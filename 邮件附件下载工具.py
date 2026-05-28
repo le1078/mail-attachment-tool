@@ -6,1143 +6,28 @@
 - 失败告警、重试、日志持久化
 """
 import imaplib
-import smtplib
-import email
-import os
-import re
-import json
-import ssl
-import threading
-import time
-import datetime
-import traceback
-import glob as glob_mod
-from email.header import decode_header
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from email.mime.base import MIMEBase
-from email import encoders
-from email.utils import formatdate, make_msgid, parsedate_to_datetime
-from email.policy import compat32
-from pathlib import Path
-from urllib.parse import unquote
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
+import threading
+import datetime
+import csv
+import os
 
-# 系统托盘
 import pystray
 from PIL import Image, ImageDraw
 
-# ==================== 配置管理 ====================
-CONFIG_FILE = Path(__file__).parent / "config.json"
-CONFIG_BACKUP_DIR = Path(__file__).parent / "config_backups"
-LOG_PERSIST_FILE = Path(__file__).parent / "mail_tool_log.txt"
-MAX_LOG_LINES = 10000
-MAX_CONFIG_BACKUPS = 5
-
-DEFAULT_CONFIG = {
-    # === 下载配置 ===
-    "imap_server": "",
-    "imap_port": 993,
-    "email_user": "",
-    "email_pass": "",
-    "sender_filter_list": [],
-    "download_keyword_filter": "",
-    "download_read_status": "all",
-    "save_folder": "",
-    "skip_ssl_verify": False,
-    "schedule_download": {
-        "days": [],
-        "hour": 9,
-        "minute": 0,
-        "second": 0,
-        "enabled": False
-    },
-    "download_filter_days": [],
-    "download_filter_time_enabled": False,
-    "download_filter_time_start": "00:00",
-    "download_filter_time_end": "23:59",
-    "download_filter_date_enabled": False,
-    "download_filter_date_start": "",
-    "download_filter_date_end": "",
-    # === 发送配置 ===
-    "smtp_server": "",
-    "smtp_port": 465,
-    "smtp_ssl": True,
-    "skip_ssl_smtp": False,
-    "send_user": "",
-    "send_pass": "",
-    "send_to": "",
-    "send_subject": "",
-    "send_body": "",
-    "send_attachment_mode": "single",
-    "send_attachment_list": [],
-    "send_attachment": "",
-    "schedule_send": {
-        "days": [],
-        "hour": 8,
-        "minute": 0,
-        "second": 0,
-        "enabled": False
-    },
-    # === 日志导出 ===
-    "log_export_enabled": False,
-    "log_export_folder": "",
-    "log_export_days": [],
-    "log_export_hour": 23,
-    "log_export_minute": 59,
-    "log_export_second": 0,
-    # === 重试配置 ===
-    "retry_enabled": True,
-    "retry_count": 3,
-    "retry_interval_minutes": 5,
-}
-
-
-def load_config():
-    if CONFIG_FILE.exists():
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            return {**DEFAULT_CONFIG, **json.load(f)}
-    return DEFAULT_CONFIG.copy()
-
-
-def save_config(config):
-    # 自动备份旧配置
-    if CONFIG_FILE.exists():
-        _auto_backup_config()
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(config, f, ensure_ascii=False, indent=2)
-
-
-def _auto_backup_config():
-    """自动备份配置文件，最多保留 MAX_CONFIG_BACKUPS 份"""
-    try:
-        CONFIG_BACKUP_DIR.mkdir(exist_ok=True)
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_path = CONFIG_BACKUP_DIR / f"config_backup_{ts}.json"
-        import shutil
-        shutil.copy2(CONFIG_FILE, backup_path)
-        # 清理旧备份
-        backups = sorted(CONFIG_BACKUP_DIR.glob("config_backup_*.json"))
-        while len(backups) > MAX_CONFIG_BACKUPS:
-            backups[0].unlink()
-            backups.pop(0)
-    except Exception:
-        pass  # 备份失败不影响主流程
-
-
-def export_config_to(config, dest_path):
-    """导出配置到指定文件"""
-    with open(dest_path, "w", encoding="utf-8") as f:
-        json.dump(config, f, ensure_ascii=False, indent=2)
-
-
-def import_config_from(src_path):
-    """从文件导入配置，返回合并后的配置字典"""
-    with open(src_path, "r", encoding="utf-8") as f:
-        imported = json.load(f)
-    return {**DEFAULT_CONFIG, **imported}
-
-
-# ==================== 日志持久化 ====================
-def load_persisted_log():
-    """启动时加载持久化日志"""
-    entries = []
-    if LOG_PERSIST_FILE.exists():
-        try:
-            with open(LOG_PERSIST_FILE, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    # 格式: [cat] YYYY-MM-DD HH:MM:SS  msg  或纯文本
-                    m = re.match(r'^\[(下载|发送|系统|查询)\]\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s{2}(.*)', line)
-                    if m:
-                        cat_map = {"下载": "download", "发送": "send", "系统": "system", "查询": "query"}
-                        entries.append({"time": m.group(2), "cat": cat_map.get(m.group(1), "system"), "msg": m.group(3)})
-        except Exception:
-            pass
-    return entries
-
-
-def persist_log_entries(entries):
-    """将日志写入持久化文件"""
-    try:
-        lines_to_keep = entries[-MAX_LOG_LINES:]
-        LOG_CATEGORIES_LABELS = {"download": "下载", "send": "发送", "system": "系统", "query": "查询"}
-        with open(LOG_PERSIST_FILE, "w", encoding="utf-8") as f:
-            for entry in lines_to_keep:
-                prefix = LOG_CATEGORIES_LABELS.get(entry["cat"], "系统")
-                line = f"[{prefix}] {entry['time']}  {entry['msg']}"
-                f.write(line + "\n")
-    except Exception:
-        pass
-
-
-# ==================== 邮件处理核心 ====================
-def decode_str(s):
-    """解码邮件头"""
-    if s is None:
-        return ""
-    try:
-        decoded_parts = decode_header(s)
-    except RecursionError:
-        return str(s) if isinstance(s, str) else s.decode("utf-8", errors="replace")
-    result = []
-    for part, charset in decoded_parts:
-        if isinstance(part, bytes):
-            try:
-                result.append(part.decode(charset or "utf-8", errors="replace"))
-            except Exception:
-                result.append(part.decode("utf-8", errors="replace"))
-        else:
-            result.append(str(part))
-    return "".join(result)
-
-
-def clean_filename(name):
-    """清理文件名中的非法字符"""
-    name = re.sub(r'[\\/:*?"<>|]', "_", name)
-    name = re.sub(r'[\x00-\x1f]', "", name)
-    name = name.strip(" .")
-    if not name:
-        name = "unnamed"
-    return name
-
-
-def _try_decode_bytes(raw_bytes):
-    """尝试用多种编码解码字节序列"""
-    for enc in ['utf-8', 'gb18030', 'gbk', 'gb2312', 'big5', 'latin-1']:
-        try:
-            trial = raw_bytes.decode(enc)
-            if '\ufffd' not in trial:
-                return trial
-        except Exception:
-            continue
-    return raw_bytes.decode('utf-8', errors='replace')
-
-
-def _parse_rfc2231_value(raw_value):
-    m = re.match(r"([A-Za-z0-9_-]+)'([^']*)'(.+)", raw_value, re.DOTALL)
-    if not m:
-        return None
-    charset = m.group(1)
-    encoded_value = m.group(3)
-    try:
-        decoded_bytes = unquote(encoded_value).encode('latin-1')
-    except Exception:
-        try:
-            decoded_bytes = unquote(encoded_value).encode('raw_unicode_escape')
-        except Exception:
-            return None
-    try:
-        result = decoded_bytes.decode(charset, errors='replace')
-        if '\ufffd' not in result:
-            return result
-    except Exception:
-        pass
-    return _try_decode_bytes(decoded_bytes) or None
-
-
-def _get_attachment_filenames_from_raw(raw_bytes):
-    """
-    用 email.policy.default 重解析原始邮件字节，提取所有 attachment 的正确文件名。
-    default 策略原生支持 RFC 2231 解码。对于任何包含替换字符(\ufffd)的失败解码
-    或 default 完全无法处理的边缘情况，回退到原始字节多编码扫描。
-    """
-    try:
-        msg_default = email.message_from_bytes(raw_bytes, policy=email.policy.default)
-    except Exception:
-        msg_default = None
-
-    filenames = []
-    has_bad_filename = False
-    if msg_default is not None:
-        for dp in msg_default.walk():
-            cd = str(dp.get("Content-Disposition", ""))
-            if "attachment" not in cd.lower():
-                continue
-            fn = dp.get_filename()
-            if fn:
-                if '=?' in fn and '?=' in fn:
-                    result = decode_str(fn)
-                    if result:
-                        filenames.append(result)
-                        continue
-                if '\ufffd' in fn:
-                    has_bad_filename = True
-                    continue
-                filenames.append(fn)
-
-    if has_bad_filename or not filenames:
-        raw_filenames = _scan_raw_for_attachment_filenames(raw_bytes)
-        if has_bad_filename:
-            return raw_filenames
-        return raw_filenames
-
-    return filenames
-
-
-def _find_boundary_from_raw(raw_bytes):
-    header_end = raw_bytes.find(b'\r\n\r\n')
-    if header_end == -1:
-        header_end = raw_bytes.find(b'\n\n')
-    if header_end == -1:
-        return None
-    header = raw_bytes[:header_end]
-    m = re.search(rb'boundary\s*=\s*"([^"]+)"', header, re.IGNORECASE)
-    if not m:
-        m = re.search(rb'boundary\s*=\s*([^\s;\r\n]+)', header, re.IGNORECASE)
-    return m.group(1) if m else None
-
-
-def _decode_filename_from_header_bytes(header_bytes):
-    rfc2231_single = re.search(rb'filename\s*\*\s*=\s*([a-zA-Z0-9_-]+)\'[^\']*\'([^\r\n;]+)', header_bytes, re.IGNORECASE)
-    if rfc2231_single:
-        charset = rfc2231_single.group(1).decode('ascii', errors='replace').strip()
-        encoded_part = rfc2231_single.group(2).decode('ascii', errors='replace').strip()
-        try:
-            decoded_str = unquote(encoded_part, encoding=charset, errors='replace')
-            if '\ufffd' not in decoded_str:
-                return decoded_str
-        except Exception:
-            pass
-
-    rfc2231_multi = {}
-    for m in re.finditer(rb'filename\s*\*\s*(\d+)\s*\*\s*=\s*([^\r\n;]+)', header_bytes, re.IGNORECASE):
-        seg_idx = int(m.group(1))
-        seg_val = m.group(2).decode('ascii', errors='replace').strip()
-        rfc2231_multi[seg_idx] = seg_val
-    if rfc2231_multi:
-        sorted_indices = sorted(rfc2231_multi.keys())
-        first_val = rfc2231_multi[sorted_indices[0]]
-        m_charset = re.match(r'([a-zA-Z0-9_-]+)\'[^\']*\'(.+)', first_val, re.DOTALL)
-        charset = None
-        if m_charset:
-            charset = m_charset.group(1)
-            rfc2231_multi[sorted_indices[0]] = m_charset.group(2)
-        combined = ''.join([rfc2231_multi[i] for i in sorted_indices if i in rfc2231_multi])
-        try:
-            if charset:
-                decoded_str = unquote(combined, encoding=charset, errors='replace')
-            else:
-                decoded_str = _try_decode_bytes(unquote(combined, errors='replace').encode('latin-1'))
-            if decoded_str and '\ufffd' not in decoded_str:
-                return decoded_str
-        except Exception:
-            pass
-
-    for tag in [b'filename', b'name']:
-        m = re.search(tag + rb'\s*=\s*"([^"]+)"', header_bytes, re.IGNORECASE)
-        if not m:
-            m = re.search(tag + rb'\s*=\s*=?([^\r\n;\s]+)', header_bytes, re.IGNORECASE)
-        if m:
-            raw_filename_bytes = m.group(1)
-            try:
-                candidate_str = raw_filename_bytes.decode('ascii', errors='strict')
-                for try_str in [candidate_str, '=?' + candidate_str]:
-                    if '=?' in try_str and '?=' in try_str and ('?B?' in try_str or '?Q?' in try_str):
-                        decoded_parts = decode_header(try_str)
-                        result_parts = []
-                        for p, cs in decoded_parts:
-                            if isinstance(p, bytes):
-                                result_parts.append(p.decode(cs or 'utf-8', errors='replace'))
-                            else:
-                                result_parts.append(str(p))
-                        joined = ''.join(result_parts)
-                        if joined and '\ufffd' not in joined and joined != try_str:
-                            return joined
-                    if candidate_str.startswith('?') and '?' in candidate_str[1:]:
-                        rfc2047_candidate = '=' + candidate_str
-                        if '=?' in rfc2047_candidate and '?=' in rfc2047_candidate and ('?B?' in rfc2047_candidate or '?Q?' in rfc2047_candidate):
-                            decoded_parts = decode_header(rfc2047_candidate)
-                            result_parts = []
-                            for p, cs in decoded_parts:
-                                if isinstance(p, bytes):
-                                    result_parts.append(p.decode(cs or 'utf-8', errors='replace'))
-                                else:
-                                    result_parts.append(str(p))
-                            joined = ''.join(result_parts)
-                            if joined and '\ufffd' not in joined and joined != rfc2047_candidate:
-                                return joined
-            except Exception:
-                pass
-            result = _try_decode_bytes(raw_filename_bytes)
-            if result and '\ufffd' not in result:
-                return result
-            try:
-                if b'%' in raw_filename_bytes:
-                    unquoted = unquote_to_bytes(raw_filename_bytes)
-                    result2 = _try_decode_bytes(unquoted)
-                    if result2 and '\ufffd' not in result2:
-                        return result2
-            except Exception:
-                pass
-            return result
-
-    return None
-
-
-def _scan_raw_for_attachment_filenames(raw_bytes):
-    boundary = _find_boundary_from_raw(raw_bytes)
-    if not boundary:
-        cd_match = re.search(rb'Content-Disposition:\s*([^\r\n]+)', raw_bytes[:4096], re.IGNORECASE)
-        if cd_match:
-            cd_str = cd_match.group(1).decode('ascii', errors='replace')
-            if 'attachment' in cd_str.lower():
-                filename = _decode_filename_from_header_bytes(raw_bytes[:4096])
-                if filename:
-                    return [filename]
-        return []
-
-    boundary_marker = b'--' + boundary
-    parts = raw_bytes.split(boundary_marker)
-
-    filenames = []
-    for part_bytes in parts[1:]:
-        if part_bytes.startswith(b'--'):
-            break
-
-        part_bytes = part_bytes.lstrip(b'\r\n')
-        sep = part_bytes.find(b'\r\n\r\n')
-        if sep == -1:
-            sep = part_bytes.find(b'\n\n')
-        if sep == -1:
-            continue
-        part_headers = part_bytes[:sep]
-
-        cd_match = re.search(rb'Content-Disposition:\s*([^\r\n]+)', part_headers, re.IGNORECASE)
-        if not cd_match:
-            continue
-        cd_value = cd_match.group(1)
-        cd_str = cd_value.decode('ascii', errors='replace')
-        if 'attachment' not in cd_str.lower():
-            continue
-
-        filename = _decode_filename_from_header_bytes(part_headers)
-        if filename:
-            filenames.append(filename)
-
-    return filenames
-
-
-def decode_attachment_filename(part):
-    """万能附件文件名解码"""
-    cd_value = ""
-    ct_value = ""
-    if hasattr(part, '_headers'):
-        for h_name, h_val in part._headers:
-            if h_name.lower() == 'content-disposition':
-                cd_value = h_val
-            elif h_name.lower() == 'content-type':
-                ct_value = h_val
-    if not cd_value:
-        cd_value = part.get('Content-Disposition', '')
-    if not ct_value:
-        ct_value = part.get('Content-Type', '')
-
-    rfc2231_parts = {}
-    for m in re.finditer(r"filename(\*(\d+))?\*\s*=\s*([^;]+)", cd_value, re.IGNORECASE):
-        seg_index = int(m.group(2)) if m.group(2) is not None else -1
-        raw_val = m.group(3).strip().strip('"')
-        if seg_index == -1:
-            decoded = _parse_rfc2231_value(raw_val)
-            if decoded and '\ufffd' not in decoded:
-                return decoded
-        else:
-            rfc2231_parts[seg_index] = raw_val
-
-    if rfc2231_parts:
-        sorted_indices = sorted(rfc2231_parts.keys())
-        first_val = rfc2231_parts[sorted_indices[0]]
-        m_charset = re.match(r"([A-Za-z0-9_-]+)'([^']*)'(.+)", first_val, re.DOTALL)
-        rfc2231_charset = None
-        if m_charset:
-            rfc2231_charset = m_charset.group(1)
-            rfc2231_parts[sorted_indices[0]] = m_charset.group(3)
-        combined = "".join(rfc2231_parts[i] for i in sorted_indices if i in rfc2231_parts)
-        try:
-            decoded_bytes = unquote(combined).encode('latin-1')
-            if rfc2231_charset:
-                result = decoded_bytes.decode(rfc2231_charset, errors='replace')
-            else:
-                result = _try_decode_bytes(decoded_bytes)
-            if result and '\ufffd' not in result:
-                return result
-        except Exception:
-            pass
-
-    try:
-        raw_bytes = part.as_bytes()
-        header_end = raw_bytes.find(b'\r\n\r\n')
-        if header_end > 0:
-            header_section = raw_bytes[:header_end]
-        else:
-            header_section = raw_bytes[:2048]
-        for pattern in [
-            rb'filename\*\s*=\s*([A-Za-z0-9_-]+)\'[^\']*\'([^\r\n;]+)',
-            rb'filename\s*=\s*"([^"]+)"',
-            rb"filename\s*=\s*([^\r\n;\s]+)",
-        ]:
-            m = re.search(pattern, header_section, re.IGNORECASE)
-            if m:
-                if b"'" in m.group(0) and m.lastindex >= 2:
-                    charset_bytes = m.group(1)
-                    value_bytes = m.group(2)
-                    try:
-                        charset = charset_bytes.decode('ascii')
-                        decoded_bytes = unquote(value_bytes.decode('ascii')).encode('latin-1')
-                        result = decoded_bytes.decode(charset, errors='replace')
-                        if '\ufffd' not in result:
-                            return result
-                    except Exception:
-                        pass
-                else:
-                    raw_filename_bytes = m.group(1)
-                    if raw_filename_bytes.startswith(b'"') and raw_filename_bytes.endswith(b'"'):
-                        raw_filename_bytes = raw_filename_bytes[1:-1]
-                    result = _try_decode_bytes(raw_filename_bytes)
-                    if result and '\ufffd' not in result:
-                        return result
-        for pattern in [
-            rb'name\*\s*=\s*([A-Za-z0-9_-]+)\'[^\']*\'([^\r\n;]+)',
-            rb'name\s*=\s*"([^"]+)"',
-            rb'name\s*=\s*([^\r\n;\s]+)',
-        ]:
-            m = re.search(pattern, header_section, re.IGNORECASE)
-            if m:
-                if b"'" in m.group(0) and m.lastindex >= 2:
-                    charset_bytes = m.group(1)
-                    value_bytes = m.group(2)
-                    try:
-                        charset = charset_bytes.decode('ascii')
-                        decoded_bytes = unquote(value_bytes.decode('ascii')).encode('latin-1')
-                        result = decoded_bytes.decode(charset, errors='replace')
-                        if '\ufffd' not in result:
-                            return result
-                    except Exception:
-                        pass
-                else:
-                    raw_name_bytes = m.group(1)
-                    if raw_name_bytes.startswith(b'"') and raw_name_bytes.endswith(b'"'):
-                        raw_name_bytes = raw_name_bytes[1:-1]
-                    result = _try_decode_bytes(raw_name_bytes)
-                    if result and '\ufffd' not in result:
-                        return result
-    except Exception:
-        pass
-
-    filename = part.get_filename()
-    if filename:
-        result = decode_str(filename)
-        if result and '\ufffd' not in result:
-            return result
-        if isinstance(filename, str) and '%' in filename:
-            try:
-                decoded = unquote(filename, encoding='utf-8', errors='replace')
-                if decoded and '\ufffd' not in decoded and decoded != filename:
-                    return decoded
-            except Exception:
-                pass
-        for recovery_enc in ['latin-1', 'cp1252']:
-            try:
-                raw_bytes = filename.encode(recovery_enc, errors='surrogateescape')
-                if any(b > 127 for b in raw_bytes):
-                    result = _try_decode_bytes(raw_bytes)
-                    if result and '\ufffd' not in result:
-                        return result
-            except Exception:
-                continue
-
-    candidates = []
-    m = re.search(r'filename\s*=\s*=\?[^?]+\?[BQ]\?[^?]+\?=', cd_value, re.IGNORECASE)
-    if m:
-        candidates.append(m.group(0).split('=', 1)[1].strip())
-    m = re.search(r'filename\s*=\s*"([^"]*)"', cd_value, re.IGNORECASE)
-    if m:
-        candidates.append(m.group(1))
-    m = re.search(r'filename\s*=\s*([^;"\s]+)', cd_value, re.IGNORECASE)
-    if m and '"' not in m.group(0):
-        candidates.append(m.group(1))
-    m = re.search(r'name\s*=\s*"([^"]*)"', ct_value, re.IGNORECASE)
-    if m:
-        candidates.append(m.group(1))
-    m = re.search(r'name\s*=\s*([^;\s"]+)', ct_value, re.IGNORECASE)
-    if m and '"' not in m.group(0):
-        candidates.append(m.group(1))
-    for c in candidates:
-        result = decode_str(c)
-        if result and '\ufffd' not in result:
-            return result
-        for recovery_enc in ['latin-1', 'cp1252']:
-            try:
-                raw_bytes = c.encode(recovery_enc, errors='surrogateescape')
-                if any(b > 127 for b in raw_bytes):
-                    result = _try_decode_bytes(raw_bytes)
-                    if result and '\ufffd' not in result:
-                        return result
-            except Exception:
-                continue
-    for c in candidates:
-        if c:
-            return decode_str(c)
-    return None
-
-
-def text_file_preview(filepath, max_chars=500):
-    """预览文本文件内容"""
-    text_exts = {'.txt', '.csv', '.log', '.sql', '.json', '.xml', '.html', '.htm',
-                 '.py', '.js', '.ts', '.java', '.c', '.cpp', '.h', '.css', '.md',
-                 '.yaml', '.yml', '.ini', '.cfg', '.conf', '.bat', '.sh', '.ps1'}
-    ext = Path(filepath).suffix.lower()
-    if ext not in text_exts:
-        return None
-    try:
-        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read(max_chars)
-        if len(content) == 0:
-            return "(空文件)"
-        if len(content) >= max_chars:
-            return content + "\n...(已截断)"
-        return content
-    except Exception:
-        return None
-
-
-# ==================== SSL兼容处理 ====================
-def _create_ssl_context(skip_verify=False):
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ctx.set_ciphers("DEFAULT:@SECLEVEL=1")
-    ctx.options |= ssl.OP_LEGACY_SERVER_CONNECT
-    ctx.options |= ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3
-    if skip_verify:
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-    return ctx
-
-
-def connect_imap(server, port, user, password, skip_ssl_verify=False):
-    """连接IMAP服务器，SSL证书错误时自动回退到跳过验证模式"""
-    ctx = _create_ssl_context(skip_verify=skip_ssl_verify)
-    try:
-        mail = imaplib.IMAP4_SSL(server, port, ssl_context=ctx)
-        mail.login(user, password)
-        return mail
-    except ssl.SSLError as e:
-        if not skip_ssl_verify:
-            # 证书验证失败 → 自动用跳过验证重试
-            ctx = _create_ssl_context(skip_verify=True)
-            mail = imaplib.IMAP4_SSL(server, port, ssl_context=ctx)
-            mail.login(user, password)
-            return mail
-        else:
-            raise  # 已经跳过验证还失败，抛出原始异常
-    except imaplib.IMAP4.error:
-        # 非SSL错误直接抛出
-        raise
-
-
-def test_imap_connection(server, port, user, password, skip_ssl_verify=False):
-    """测试IMAP连接（仅登录，不执行操作）"""
-    mail = connect_imap(server, port, user, password, skip_ssl_verify)
-    mail.logout()
-    return True
-
-
-def test_smtp_connection(smtp_server, smtp_port, use_ssl, user, password, skip_ssl_verify):
-    """测试SMTP连接（仅登录，不发送）"""
-    ctx = _create_ssl_context(skip_verify=skip_ssl_verify)
-    if use_ssl:
-        server = smtplib.SMTP_SSL(smtp_server, smtp_port, context=ctx)
-    else:
-        server = smtplib.SMTP(smtp_server, smtp_port)
-        server.ehlo()
-        server.starttls(context=ctx)
-        server.ehlo()
-    server.login(user, password)
-    server.quit()
-    return True
-
-
-def get_sent_folder_name(mail, log_func=None):
-    """自动检测已发送文件夹名称，支持国内外主流邮箱"""
-    status, folders = mail.list()
-    if status != "OK":
-        return None
-
-    # 提取所有文件夹名
-    all_folders = []
-    for folder_info in folders:
-        folder_str = folder_info.decode('utf-8', errors='replace') if isinstance(folder_info, bytes) else folder_info
-        # IMAP LIST 格式: '(\\HasNoChildren) "/" "Sent"' 或 '(\\HasChildren) "/" "[Gmail]"'
-        parts = folder_str.split('"')
-        if len(parts) >= 4:
-            all_folders.append(parts[-2])
-
-    if log_func:
-        log_func(f"服务器文件夹列表: {all_folders}")
-
-    # 候选已发送文件夹名（按匹配优先级排列）
-    candidates = [
-        'Sent Messages',          # QQ邮箱英文
-        'Sent Items',             # Outlook/Hotmail
-        'Sent Mail',              # Gmail
-        'Sent',                   # 通用英文
-        '已发送',                  # QQ/163/Coremail 中文
-        '已发送邮件',              # 部分企业邮箱
-        '&XfJT0ZAB-',            # IMAP UTF-7 编码的"已发送"
-        '&XfJT0ZABkK5O9g-',      # 另一种编码
-    ]
-
-    # 按优先级匹配
-    for candidate in candidates:
-        for f in all_folders:
-            if candidate.lower() in f.lower():
-                if log_func:
-                    log_func(f"匹配到已发送文件夹: {f}")
-                return f
-
-    # 兜底：在文件夹名中搜索"sent"或"已发送"关键词
-    for f in all_folders:
-        f_lower = f.lower()
-        if 'sent' in f_lower or '已发送' in f:
-            if log_func:
-                log_func(f"模糊匹配到已发送文件夹: {f}")
-            return f
-
-    if log_func:
-        log_func(f"未匹配到已发送文件夹，可用文件夹: {all_folders}")
-    return None
-
-
-def archive_to_sent(config, raw_email_bytes, log_func):
-    """通过IMAP将已发送邮件存档到已发送文件夹"""
-    try:
-        imap_server = config.get("imap_server", "")
-        send_user = config.get("send_user") or config.get("email_user", "")
-        send_pass = config.get("send_pass") or config.get("email_pass", "")
-        if not imap_server or not send_user:
-            log_func("  跳过存档: IMAP服务器或账号未配置")
-            return
-        mail = connect_imap(imap_server, config.get("imap_port", 993),
-                            send_user, send_pass,
-                            config.get("skip_ssl_verify", False))
-        sent_folder = get_sent_folder_name(mail, log_func=log_func)
-        if sent_folder:
-            # 使用双引号包裹（支持中文文件夹名和嵌套文件夹如 [Gmail]/Sent Mail）
-            quoted_folder = f'"{sent_folder}"' if ' ' in sent_folder or '/' in sent_folder else sent_folder
-            result = mail.append(quoted_folder, '\\Seen',
-                                 imaplib.Time2Internaldate(time.time()),
-                                 raw_email_bytes)
-            if result[0] == "OK":
-                log_func(f"  已存档到: {sent_folder}")
-            else:
-                log_func(f"  存档失败: {result}")
-        else:
-            log_func("  未找到已发送文件夹，跳过存档（可在日志中查看服务器文件夹列表）")
-        mail.logout()
-    except Exception as e:
-        log_func(f"  存档异常: {e}")
-
-
-def fetch_attachments(mail, sender_filter_list, save_folder, log_func,
-                      keyword_filter="", read_status="all",
-                      filter_days=None, filter_time_enabled=False,
-                      filter_time_start="00:00", filter_time_end="23:59",
-                      filter_date_enabled=False, filter_date_start="", filter_date_end=""):
-    mail.select("INBOX")
-    if read_status == "unseen":
-        search_criteria = "UNSEEN"
-    else:
-        search_criteria = "ALL"
-    status, messages = mail.search(None, search_criteria)
-    if status != "OK":
-        log_func("搜索邮件失败")
-        return 0
-
-    mail_ids = messages[0].split()
-    if not mail_ids:
-        log_func("收件箱为空")
-        return 0
-
-    log_func(f"收件箱共 {len(mail_ids)} 封邮件，筛选条件: 发件人={sender_filter_list}, 关键词={keyword_filter or '无'}, 状态={read_status}，开始扫描...")
-    download_count = 0
-
-    processed_file = Path(__file__).parent / "processed_ids.txt"
-    processed_ids = set()
-    if read_status == "unseen" and processed_file.exists():
-        with open(processed_file, "r", encoding="utf-8") as f:
-            processed_ids = set(line.strip() for line in f)
-
-    new_processed = set()
-    for mail_id in reversed(mail_ids[-100:]):
-        mail_id_str = mail_id.decode()
-        if read_status == "unseen" and mail_id_str in processed_ids:
-            continue
-        if read_status == "seen":
-            try:
-                flag_status, flag_data = mail.fetch(mail_id, "(FLAGS)")
-                if flag_status == "OK" and flag_data:
-                    flags = str(flag_data[0])
-                    if "\\Seen" not in flags:
-                        continue
-                else:
-                    continue
-            except Exception:
-                continue
-
-        status, msg_data = mail.fetch(mail_id, "(RFC822)")
-        if status != "OK":
-            continue
-
-        for response_part in msg_data:
-            if isinstance(response_part, tuple):
-                raw_email_bytes = response_part[1]  # 整个邮件的原始IMAP字节
-                msg = email.message_from_bytes(raw_email_bytes)
-                from_ = decode_str(msg.get("From", ""))
-                subject = decode_str(msg.get("Subject", ""))
-                from_lower = from_.lower()
-                sender_matched = True
-                if sender_filter_list and any(f.strip() for f in sender_filter_list):
-                    sender_matched = any(f.strip().lower() in from_lower for f in sender_filter_list if f.strip())
-                kw = (keyword_filter or "").strip().lower()
-                kw_matched = True
-                if kw:
-                    subj_lower = subject.lower()
-                    kw_matched = kw in subj_lower
-                if not (sender_matched and kw_matched):
-                    continue
-                date_str = msg.get("Date", "")
-                if date_str and ((filter_days and len(filter_days) < 7) or filter_time_enabled or filter_date_enabled):
-                    try:
-                        dt = parsedate_to_datetime(date_str)
-                        if filter_days and dt.isoweekday() not in filter_days:
-                            continue
-                        if filter_time_enabled:
-                            h, m = dt.hour, dt.minute
-                            t_start = int(filter_time_start.split(":")[0]) * 60 + int(filter_time_start.split(":")[1])
-                            t_end = int(filter_time_end.split(":")[0]) * 60 + int(filter_time_end.split(":")[1])
-                            now_t = h * 60 + m
-                            if t_start <= t_end:
-                                if not (t_start <= now_t <= t_end):
-                                    continue
-                            else:
-                                if not (now_t >= t_start or now_t <= t_end):
-                                    continue
-                        if filter_date_enabled and filter_date_start and filter_date_end:
-                            dt_date = dt.date()
-                            d_start = datetime.datetime.strptime(filter_date_start, "%Y-%m-%d").date()
-                            d_end = datetime.datetime.strptime(filter_date_end, "%Y-%m-%d").date()
-                            if not (d_start <= dt_date <= d_end):
-                                continue
-                    except Exception:
-                        pass
-
-                log_func(f"  匹配发件人: {from_} | 主题: {subject}")
-
-                raw_filenames = _get_attachment_filenames_from_raw(raw_email_bytes)
-                fn_iter = iter(raw_filenames)
-
-                if msg.is_multipart():
-                    for part in msg.walk():
-                        content_disposition = str(part.get("Content-Disposition", ""))
-                        if "attachment" in content_disposition:
-                            try:
-                                filename = next(fn_iter)
-                            except StopIteration:
-                                filename = decode_attachment_filename(part)
-                            if not filename:
-                                log_func(f"   ⚠ 附件解码失败")
-                                continue
-                            filename = clean_filename(filename)
-                            filepath = os.path.join(save_folder, filename)
-                            if os.path.exists(filepath):
-                                base, ext = os.path.splitext(filename)
-                                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                                filepath = os.path.join(save_folder, f"{base}_{ts}{ext}")
-                            with open(filepath, "wb") as f:
-                                f.write(part.get_payload(decode=True))
-                            log_func(f"    -> 已下载: {os.path.basename(filepath)}")
-                            download_count += 1
-                else:
-                    content_disposition = str(msg.get("Content-Disposition", ""))
-                    if "attachment" in content_disposition:
-                        try:
-                            filename = next(fn_iter)
-                        except StopIteration:
-                            filename = decode_attachment_filename(msg)
-                        if not filename:
-                            log_func(f"   ⚠ 附件解码失败")
-                            continue
-                        filename = clean_filename(filename)
-                        filepath = os.path.join(save_folder, filename)
-                        if os.path.exists(filepath):
-                            base, ext = os.path.splitext(filename)
-                            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                            filepath = os.path.join(save_folder, f"{base}_{ts}{ext}")
-                        with open(filepath, "wb") as f:
-                            f.write(msg.get_payload(decode=True))
-                        log_func(f"    -> 已下载: {os.path.basename(filepath)}")
-                        download_count += 1
-
-                new_processed.add(mail_id_str)
-
-    all_processed = processed_ids | new_processed
-    all_processed_list = list(all_processed)
-    if len(all_processed_list) > 1000:
-        all_processed_list = all_processed_list[-1000:]
-    with open(processed_file, "w", encoding="utf-8") as f:
-        for mid in all_processed_list:
-            f.write(mid + "\n")
-    return download_count
-
-
-def send_email(smtp_server, smtp_port, use_ssl, user, password, to_addr,
-               subject, body, attachment_paths, skip_ssl_verify, log_func,
-               config=None):
-    """通过SMTP发送邮件（带附件），attachment_paths 为文件路径列表"""
-    recipients = [r.strip() for r in to_addr.split(",") if r.strip()]
-    if not recipients:
-        raise ValueError("收件人列表为空")
-
-    # 附件预检
-    if attachment_paths:
-        missing = [p for p in attachment_paths if not os.path.isfile(p)]
-        if missing:
-            log_func(f"  ⚠ 以下附件不存在: {missing}")
-            # 过滤掉不存在的附件继续发送
-            attachment_paths = [p for p in attachment_paths if os.path.isfile(p)]
-            if not attachment_paths:
-                log_func("  所有附件均不存在，将以无附件方式发送")
-
-    msg = MIMEMultipart()
-    msg["From"] = user
-    msg["To"] = ", ".join(recipients)
-    msg["Subject"] = subject or "(无主题)"
-    msg["Date"] = formatdate(localtime=True)
-    msg["Message-ID"] = make_msgid()
-
-    msg.attach(MIMEText(body or " ", "plain", "utf-8"))
-
-    total_size = 0
-    if attachment_paths:
-        for att_path in attachment_paths:
-            if os.path.isfile(att_path):
-                filename = os.path.basename(att_path)
-                file_size = os.path.getsize(att_path)
-                with open(att_path, "rb") as f:
-                    part = MIMEBase("application", "octet-stream")
-                    part.set_payload(f.read())
-                encoders.encode_base64(part)
-                part.add_header("Content-Disposition", "attachment",
-                                filename=("utf-8", "", filename))
-                msg.attach(part)
-                total_size += file_size
-                log_func(f"  附件: {filename} ({file_size} 字节)")
-                # 文本文件预览
-                preview = text_file_preview(att_path)
-                if preview:
-                    log_func(f"  附件预览(文本):\n{preview[:300]}")
-        log_func(f"  共 {len(attachment_paths)} 个附件，总大小 {total_size} 字节")
-    else:
-        log_func("  无附件")
-
-    ctx = _create_ssl_context(skip_verify=skip_ssl_verify)
-    if use_ssl:
-        server = smtplib.SMTP_SSL(smtp_server, smtp_port, context=ctx)
-    else:
-        server = smtplib.SMTP(smtp_server, smtp_port)
-        server.ehlo()
-        server.starttls(context=ctx)
-        server.ehlo()
-
-    server.login(user, password)
-    server.sendmail(user, recipients, msg.as_string())
-    server.quit()
-    log_func(f"  邮件已发送 -> {', '.join(recipients)}")
-
-    # 存档到已发送文件夹
-    if config:
-        archive_to_sent(config, msg.as_bytes(), log_func)
-
-
-def query_emails(mail, folder, search_criteria, max_count=50, log_func=None,
-                 start_date=None, end_date=None, read_filter="all"):
-    """查询指定文件夹中的邮件列表，返回邮件摘要列表
-    
-    start_date/end_date: 日期字符串 "YYYY-MM-DD"，可筛选日期范围
-    read_filter: "all" = 全部, "seen" = 仅已读, "unseen" = 仅未读
-    """
-    # 智能选择文件夹：简单文件夹名不加引号，含空格/特殊字符才加
-    if " " in folder or "/" in folder or any(ord(c) > 127 for c in folder):
-        select_name = f'"{folder}"'
-    else:
-        select_name = folder
-    try:
-        mail.select(select_name)
-    except Exception:
-        # 回退：尝试不带引号
-        try:
-            mail.select(folder)
-        except Exception as e:
-            if log_func:
-                log_func(f"无法选择文件夹 {folder}: {e}")
-            return []
-
-    # 构建完整 IMAP 搜索条件（含日期范围和已读/未读筛选）
-    parts = []
-    if read_filter == "seen":
-        parts.append("SEEN")
-    elif read_filter == "unseen":
-        parts.append("UNSEEN")
-    if search_criteria and search_criteria != "ALL":
-        parts.append(search_criteria)
-    if start_date:
-        # IMAP SINCE 格式: DD-Mon-YYYY
-        try:
-            dt = datetime.datetime.strptime(start_date, "%Y-%m-%d")
-            parts.append(f'SINCE "{dt.strftime("%d-%b-%Y")}"')
-        except ValueError:
-            pass
-    if end_date:
-        try:
-            dt = datetime.datetime.strptime(end_date, "%Y-%m-%d")
-            parts.append(f'BEFORE "{dt.strftime("%d-%b-%Y")}"')
-        except ValueError:
-            pass
-
-    if parts:
-        criteria = " ".join(parts)
-    else:
-        criteria = "ALL"
-
-    if log_func:
-        log_func(f"已选择文件夹: {folder}, 搜索条件: {criteria}")
-
-    status, messages = mail.search(None, criteria)
-    if status != "OK":
-        if log_func:
-            log_func(f"搜索失败, status={status}")
-        return []
-
-    mail_ids = messages[0].split()
-    if log_func:
-        log_func(f"找到 {len(mail_ids)} 封邮件")
-
-    result = []
-    for mail_id in reversed(mail_ids[-max_count:]):
-        status, msg_data = mail.fetch(mail_id, "(RFC822 FLAGS)")
-        if status != "OK":
-            continue
-        seen = False
-        raw_bytes = None
-        for response_part in msg_data:
-            if isinstance(response_part, tuple):
-                raw_bytes = response_part[1]
-                if isinstance(response_part[0], bytes) and b'\\Seen' in response_part[0]:
-                    seen = True
-            elif isinstance(response_part, bytes):
-                if b'\\Seen' in response_part:
-                    seen = True
-        if raw_bytes is None:
-            continue
-        msg = email.message_from_bytes(raw_bytes)
-        date_str = msg.get("Date", "")
-        try:
-            dt = parsedate_to_datetime(date_str)
-            date_formatted = dt.strftime("%Y-%m-%d %H:%M")
-        except Exception:
-            date_formatted = date_str
-        result.append({
-            "id": mail_id.decode(),
-            "from": decode_str(msg.get("From", "")),
-            "to": decode_str(msg.get("To", "")),
-            "subject": decode_str(msg.get("Subject", "")),
-            "date": date_formatted,
-            "has_attachments": "attachment" in str(msg).lower(),
-            "seen": seen,
-        })
-    return result
-
-
-def fetch_email_detail(mail, mail_id, log_func=None):
-    """获取单封邮件的详细信息"""
-    status, msg_data = mail.fetch(mail_id.encode(), "(RFC822 FLAGS)")
-    if status != "OK":
-        return None
-    seen = False
-    raw_email_bytes = None
-    for response_part in msg_data:
-        if isinstance(response_part, tuple):
-            raw_email_bytes = response_part[1]
-            if isinstance(response_part[0], bytes) and b'\\Seen' in response_part[0]:
-                seen = True
-        elif isinstance(response_part, bytes):
-            if b'\\Seen' in response_part:
-                seen = True
-    if raw_email_bytes is None:
-        return None
-    msg = email.message_from_bytes(raw_email_bytes)
-    detail = {
-        "from": decode_str(msg.get("From", "")),
-        "to": decode_str(msg.get("To", "")),
-        "cc": decode_str(msg.get("Cc", "")),
-        "subject": decode_str(msg.get("Subject", "")),
-        "date": msg.get("Date", ""),
-        "body": "",
-        "attachments": [],
-        "seen": seen,
-    }
-
-    raw_filenames = _get_attachment_filenames_from_raw(raw_email_bytes)
-    fn_iter = iter(raw_filenames)
-
-    if msg.is_multipart():
-        for part in msg.walk():
-            content_type = part.get_content_type()
-            content_disposition = str(part.get("Content-Disposition", ""))
-            if "attachment" in content_disposition:
-                try:
-                    filename = next(fn_iter)
-                except StopIteration:
-                    filename = decode_attachment_filename(part)
-                if filename:
-                    detail["attachments"].append({
-                        "filename": filename,
-                        "size": len(part.get_payload(decode=True) or b""),
-                        "payload": part.get_payload(decode=True),
-                    })
-            elif content_type == "text/plain" and "attachment" not in content_disposition:
-                try:
-                    payload = part.get_payload(decode=True)
-                    if payload:
-                        detail["body"] = _try_decode_bytes(payload)[:5000]
-                except Exception:
-                    pass
-    else:
-        content_type = msg.get_content_type()
-        content_disposition = str(msg.get("Content-Disposition", ""))
-        if "attachment" in content_disposition:
-            try:
-                filename = next(fn_iter)
-            except StopIteration:
-                filename = decode_attachment_filename(msg)
-            if filename:
-                detail["attachments"].append({
-                    "filename": filename,
-                    "size": len(msg.get_payload(decode=True) or b""),
-                    "payload": msg.get_payload(decode=True),
-                })
-        elif content_type == "text/plain":
-            try:
-                payload = msg.get_payload(decode=True)
-                if payload:
-                    detail["body"] = _try_decode_bytes(payload)[:5000]
-            except Exception:
-                pass
-    return detail
-
-
+from config_manager import (
+    CONFIG_FILE, DEFAULT_CONFIG as _DEFAULT_CONFIG,
+    load_config, save_config, load_persisted_log, persist_log_entries,
+    export_config_to, import_config_from, validate_config, LOG_CATEGORIES_LABELS
+)
+from mail_utils import decode_str, clean_filename
+from imap_backend import (
+    connect_imap, test_imap_connection, get_sent_folder_name,
+    archive_to_sent, fetch_attachments, query_emails, fetch_email_detail,
+    batch_fetch_email_details, mark_email_as_read, retry_on_network_error
+)
+from smtp_backend import send_email, test_smtp_connection
 # ==================== GUI ====================
 class MailAttachmentTool:
     WEEKDAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
@@ -1169,6 +54,10 @@ class MailAttachmentTool:
         self._start_clock_update()
 
         self.log("程序已启动，请配置参数后点击【启动定时任务】")
+        try:
+            validate_config(self.config)
+        except ValueError as e:
+            self.log(f"⚠ 配置校验警告: {e}", "system")
 
     # ---------- UI构建 ----------
     def _build_ui(self):
@@ -1522,6 +411,10 @@ class MailAttachmentTool:
         self.entry_query_keyword = ttk.Entry(query_ctrl1, width=20)
         self.entry_query_keyword.pack(side=tk.LEFT, padx=3)
 
+        self.var_search_body = tk.BooleanVar(value=False)
+        self.chk_search_body = ttk.Checkbutton(query_ctrl1, text="搜索正文", variable=self.var_search_body)
+        self.chk_search_body.pack(side=tk.LEFT, padx=3)
+
         ttk.Label(query_ctrl1, text="已读/未读:").pack(side=tk.LEFT, padx=(10, 0))
         self.combo_read_filter = ttk.Combobox(query_ctrl1, width=6, state="readonly",
                                               values=["全部", "已读", "未读"])
@@ -1553,6 +446,17 @@ class MailAttachmentTool:
         self.spin_query_count.pack(side=tk.LEFT, padx=(2, 5))
         self.spin_query_count.set("50")
 
+        # 邮件列表操作栏
+        query_ctrl3 = ttk.Frame(tab_query)
+        query_ctrl3.pack(fill=tk.X, pady=(3, 3))
+        ttk.Button(query_ctrl3, text="全选", command=self._select_all_mails, width=6).pack(side=tk.LEFT, padx=2)
+        ttk.Button(query_ctrl3, text="取消全选", command=self._deselect_all_mails, width=8).pack(side=tk.LEFT, padx=2)
+        self.lbl_selected_count = ttk.Label(query_ctrl3, text="", foreground="#0078D4")
+        self.lbl_selected_count.pack(side=tk.LEFT, padx=(10, 0))
+        self.btn_batch_download = ttk.Button(query_ctrl3, text="批量下载所选附件",
+                                              command=self._batch_download_query_attachments, width=18)
+        self.btn_batch_download.pack(side=tk.RIGHT, padx=2)
+
         # 邮件列表 + 详情 左右分栏
         query_paned = ttk.PanedWindow(tab_query, orient=tk.HORIZONTAL)
         query_paned.pack(fill=tk.BOTH, expand=True)
@@ -1563,11 +467,11 @@ class MailAttachmentTool:
 
         columns = ("状态", "发件人/收件人", "主题", "日期")
         self.mail_tree = ttk.Treeview(list_frame, columns=columns, show="headings",
-                                       selectmode="browse", height=15)
-        self.mail_tree.heading("状态", text="状态")
-        self.mail_tree.heading("发件人/收件人", text="发件人/收件人")
-        self.mail_tree.heading("主题", text="主题")
-        self.mail_tree.heading("日期", text="日期")
+                                       selectmode="extended", height=15)
+        self.mail_tree.heading("状态", text="状态", command=lambda: self._sort_treeview("状态"))
+        self.mail_tree.heading("发件人/收件人", text="发件人/收件人", command=lambda: self._sort_treeview("发件人/收件人"))
+        self.mail_tree.heading("主题", text="主题", command=lambda: self._sort_treeview("主题"))
+        self.mail_tree.heading("日期", text="日期", command=lambda: self._sort_treeview("日期"))
         self.mail_tree.column("状态", width=48, anchor=tk.CENTER)
         self.mail_tree.column("发件人/收件人", width=150)
         self.mail_tree.column("主题", width=190)
@@ -1578,6 +482,17 @@ class MailAttachmentTool:
         tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.mail_tree.config(yscrollcommand=tree_scroll.set)
         self.mail_tree.bind("<<TreeviewSelect>>", self._on_mail_select)
+
+        self._tree_sort_col = None
+        self._tree_sort_reverse = False
+
+        self._tree_context_menu = tk.Menu(self.mail_tree, tearoff=0)
+        self._tree_context_menu.add_command(label="标记已读", command=self._mark_selected_as_read)
+        self._tree_context_menu.add_command(label="下载所选邮件附件", command=self._download_query_attachment)
+        self._tree_context_menu.add_command(label="批量下载所选邮件附件", command=self._batch_download_query_attachments)
+        self._tree_context_menu.add_separator()
+        self._tree_context_menu.add_command(label="导出查询结果为CSV", command=self._export_query_csv)
+        self.mail_tree.bind("<Button-3>", self._on_tree_right_click)
 
         # 右侧：邮件详情
         detail_frame = ttk.Frame(query_paned)
@@ -1593,6 +508,10 @@ class MailAttachmentTool:
         detail_btn_frame.pack(fill=tk.X, pady=(5, 0))
         ttk.Button(detail_btn_frame, text="下载此邮件附件",
                    command=self._download_query_attachment, width=16).pack(side=tk.LEFT, padx=3)
+        ttk.Button(detail_btn_frame, text="标记已读",
+                   command=self._mark_selected_as_read, width=10).pack(side=tk.LEFT, padx=3)
+        ttk.Button(detail_btn_frame, text="导出CSV",
+                   command=self._export_query_csv, width=8).pack(side=tk.LEFT, padx=3)
         self.query_detail_data = None  # 缓存选中邮件的详情
 
         # ================================================================
@@ -1739,7 +658,7 @@ class MailAttachmentTool:
         self.entry_folder.insert(0, cfg.get("save_folder", ""))
         self.var_skip_ssl.set(cfg.get("skip_ssl_verify", False))
 
-        dl = cfg.get("schedule_download", DEFAULT_CONFIG["schedule_download"])
+        dl = cfg.get("schedule_download", _DEFAULT_CONFIG["schedule_download"])
         self.var_dl_enabled.set(dl.get("enabled", False))
         days = dl.get("days", [])
         for i in range(7):
@@ -1793,7 +712,7 @@ class MailAttachmentTool:
             if paths:
                 self.entry_send_attachment.insert(0, "; ".join(paths))
 
-        sd = cfg.get("schedule_send", DEFAULT_CONFIG["schedule_send"])
+        sd = cfg.get("schedule_send", _DEFAULT_CONFIG["schedule_send"])
         self.var_sd_enabled.set(sd.get("enabled", False))
         send_days = sd.get("days", [])
         for i in range(7):
@@ -2256,7 +1175,19 @@ class MailAttachmentTool:
                 # 关键词本地过滤
                 if keyword:
                     kw = keyword.lower()
-                    emails = [e for e in emails if kw in (e.get("subject") or "").lower() or kw in (e.get("from") or "").lower()]
+                    search_body = self.var_search_body.get()
+                    if search_body:
+                        filtered = []
+                        for e in emails:
+                            if kw in (e.get("subject") or "").lower() or kw in (e.get("from") or "").lower():
+                                filtered.append(e)
+                                continue
+                            detail = fetch_email_detail(mail, e["id"])
+                            if detail and kw in (detail.get("body") or "").lower():
+                                filtered.append(e)
+                        emails = filtered
+                    else:
+                        emails = [e for e in emails if kw in (e.get("subject") or "").lower() or kw in (e.get("from") or "").lower()]
 
                 # 回到主线程更新 UI
                 self.root.after(0, lambda: self._query_success(emails, folder))
@@ -2314,6 +1245,7 @@ class MailAttachmentTool:
 
     def _on_mail_select(self, event):
         """选中邮件时显示详情"""
+        self._update_selected_count()
         selection = self.mail_tree.selection()
         if not selection:
             return
@@ -2427,6 +1359,230 @@ class MailAttachmentTool:
             count += 1
         messagebox.showinfo("下载完成", f"成功下载 {count} 个附件到:\n{folder}")
         self.log(f"本次下载了 {count} 个附件", "query")
+
+    def _update_selected_count(self):
+        count = len(self.mail_tree.selection())
+        if count > 0:
+            self.lbl_selected_count.config(text=f"已选 {count} 封")
+        else:
+            self.lbl_selected_count.config(text="")
+
+    def _select_all_mails(self):
+        for item in self.mail_tree.get_children():
+            self.mail_tree.selection_add(item)
+        self._update_selected_count()
+
+    def _deselect_all_mails(self):
+        self.mail_tree.selection_remove(*self.mail_tree.selection())
+        self._update_selected_count()
+
+    def _batch_download_query_attachments(self):
+        selection = self.mail_tree.selection()
+        if not selection:
+            messagebox.showinfo("提示", "请先在左侧列表中选中要下载的邮件（支持 Ctrl+点击 多选）")
+            return
+
+        folder = filedialog.askdirectory(title="选择批量下载附件保存目录")
+        if not folder:
+            return
+
+        query_folder = self.combo_query_folder.get()
+        cfg = self.config
+        total_mails = len(selection)
+        self.log("=" * 50, "query")
+        self.log(f"开始批量下载: {total_mails} 封邮件的附件...", "query")
+        self.btn_batch_download.config(state=tk.DISABLED, text="下载中...")
+
+        def _batch_worker():
+            total_attachments = 0
+            success_mails = 0
+            failed_mails = 0
+            mail = None
+            try:
+                imap_user = cfg["email_user"]
+                imap_pass = cfg["email_pass"]
+                if query_folder == "已发送":
+                    sent_user = cfg.get("send_user") or cfg["email_user"]
+                    sent_pass = cfg.get("send_pass") or cfg["email_pass"]
+                    imap_user = sent_user
+                    imap_pass = sent_pass
+
+                mail = connect_imap(cfg["imap_server"], cfg["imap_port"],
+                                    imap_user, imap_pass,
+                                    cfg.get("skip_ssl_verify", False))
+
+                actual_folder = query_folder
+                if query_folder == "已发送":
+                    sent_folder = get_sent_folder_name(mail,
+                        log_func=lambda msg: self.root.after(0, lambda: self.log(msg, "query")))
+                    actual_folder = sent_folder or "INBOX"
+
+                if " " in actual_folder or "/" in actual_folder or any(ord(c) > 127 for c in actual_folder):
+                    select_name = f'"{actual_folder}"'
+                else:
+                    select_name = actual_folder
+                try:
+                    mail.select(select_name)
+                except Exception:
+                    mail.select(actual_folder)
+
+                details, fetch_failed = batch_fetch_email_details(mail, list(selection),
+                    log_func=lambda msg: self.root.after(0, lambda: self.log(msg, "query")))
+                failed_mails = fetch_failed
+
+                for detail in details:
+                    if detail.get("attachments"):
+                        mail_att_count = 0
+                        for att in detail["attachments"]:
+                            filename = clean_filename(att["filename"])
+                            filepath = os.path.join(folder, filename)
+                            if os.path.exists(filepath):
+                                base, ext = os.path.splitext(filename)
+                                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                                filepath = os.path.join(folder, f"{base}_{ts}{ext}")
+                            with open(filepath, "wb") as f:
+                                f.write(att["payload"])
+                            mail_att_count += 1
+                            total_attachments += 1
+                        self.root.after(0, lambda d=detail, c=mail_att_count:
+                            self.log(f"  ✓ {d['subject'][:40]} — {c} 个附件", "query"))
+                        success_mails += 1
+                    else:
+                        self.root.after(0, lambda d=detail:
+                            self.log(f"  - {d['subject'][:40]} — 无附件", "query"))
+                        success_mails += 1
+
+                self.root.after(0, lambda: self._batch_download_done(
+                    success_mails, total_mails, total_attachments, folder, failed_mails))
+            except imaplib.IMAP4.error:
+                self.root.after(0, lambda: self._batch_download_failed(
+                    "IMAP连接或认证失败，请检查服务器地址和密码"))
+            except Exception:
+                self.root.after(0, lambda: self._batch_download_failed(
+                    f"批量下载出错，请检查网络连接后重试"))
+            finally:
+                if mail is not None:
+                    try:
+                        mail.logout()
+                    except Exception:
+                        pass
+
+        threading.Thread(target=_batch_worker, daemon=True).start()
+
+    def _batch_download_done(self, success_mails, total_mails, total_attachments, folder, failed_mails=0):
+        self.btn_batch_download.config(state=tk.NORMAL, text="批量下载所选附件")
+        status_parts = [f"处理邮件: {success_mails}/{total_mails} 封"]
+        if failed_mails > 0:
+            status_parts.append(f"获取失败: {failed_mails} 封")
+        status_parts.append(f"下载附件: {total_attachments} 个")
+        self.log(f"批量下载完成: {success_mails}/{total_mails} 封邮件, 共 {total_attachments} 个附件", "query")
+        self.log("=" * 50, "query")
+        msg = f"批量下载完成！\n\n" + "\n".join(status_parts) + f"\n保存目录: {folder}"
+        if total_attachments == 0:
+            msg += "\n\n(所选邮件均无附件)"
+        messagebox.showinfo("批量下载完成", msg)
+
+    def _batch_download_failed(self, error_msg):
+        self.btn_batch_download.config(state=tk.NORMAL, text="批量下载所选附件")
+        self.log(f"批量下载失败: {error_msg}", "query")
+        self.log("=" * 50, "query")
+        messagebox.showerror("批量下载失败", f"批量下载出错:\n{error_msg}")
+
+    def _mark_selected_as_read(self):
+        """将当前选中的未读邮件标记为已读（支持多选）"""
+        selection = self.mail_tree.selection()
+        if not selection:
+            messagebox.showinfo("提示", "请先选中邮件")
+            return
+
+        unseen_ids = [mid for mid in selection
+                      if self.mail_tree.item(mid, "values") and self.mail_tree.item(mid, "values")[0] == "未读"]
+        if not unseen_ids:
+            messagebox.showinfo("提示", "所选邮件均已读")
+            return
+
+        folder = self.combo_query_folder.get()
+        cfg = self.config
+
+        def _mark_worker():
+            try:
+                imap_user = cfg["email_user"]
+                imap_pass = cfg["email_pass"]
+                actual_folder = folder
+                if folder == "已发送":
+                    sent_user = cfg.get("send_user") or cfg["email_user"]
+                    sent_pass = cfg.get("send_pass") or cfg["email_pass"]
+                    imap_user = sent_user
+                    imap_pass = sent_pass
+
+                mail = connect_imap(cfg["imap_server"], cfg["imap_port"],
+                                    imap_user, imap_pass,
+                                    cfg.get("skip_ssl_verify", False))
+
+                if folder == "已发送":
+                    sent_folder = get_sent_folder_name(mail)
+                    actual_folder = sent_folder or "INBOX"
+
+                success_count = 0
+                for mail_id in unseen_ids:
+                    if mark_email_as_read(mail, actual_folder, mail_id,
+                                          log_func=lambda msg, mid=mail_id: self.root.after(0, lambda: self.log(msg, "query"))):
+                        success_count += 1
+                        self.root.after(0, lambda mid=mail_id: self._on_mark_read_success(mid))
+                mail.logout()
+                self.root.after(0, lambda: self.log(f"批量标记已读完成: {success_count}/{len(unseen_ids)} 封", "query"))
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("错误", f"标记已读失败: {e}"))
+
+        threading.Thread(target=_mark_worker, daemon=True).start()
+
+    def _on_mark_read_success(self, mail_id):
+        """标记已读成功后更新 UI"""
+        values = list(self.mail_tree.item(mail_id, "values"))
+        if values:
+            values[0] = "已读"
+            self.mail_tree.item(mail_id, values=tuple(values), tags=())
+        if self.query_detail_data:
+            self.query_detail_data["seen"] = True
+            self._show_mail_detail(self.query_detail_data)
+        self.log(f"邮件 {mail_id} 已标记为已读", "query")
+
+    def _sort_treeview(self, col):
+        if self._tree_sort_col == col:
+            self._tree_sort_reverse = not self._tree_sort_reverse
+        else:
+            self._tree_sort_reverse = False
+        self._tree_sort_col = col
+        col_idx = {"状态": 0, "发件人/收件人": 1, "主题": 2, "日期": 3}
+        idx = col_idx.get(col, 0)
+        items = [(self.mail_tree.set(k, col), k) for k in self.mail_tree.get_children("")]
+        items.sort(reverse=self._tree_sort_reverse, key=lambda x: x[0].lower())
+        for i, (_, item) in enumerate(items):
+            self.mail_tree.move(item, "", i)
+
+    def _on_tree_right_click(self, event):
+        iid = self.mail_tree.identify_row(event.y)
+        if iid:
+            if iid not in self.mail_tree.selection():
+                self.mail_tree.selection_set(iid)
+            self._tree_context_menu.tk_popup(event.x_root, event.y_root)
+
+    def _export_query_csv(self):
+        children = self.mail_tree.get_children()
+        if not children:
+            messagebox.showinfo("提示", "查询列表为空，请先查询邮件")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv", filetypes=[("CSV文件", "*.csv")],
+            initialfile=f"邮件查询结果_{datetime.datetime.now():%Y%m%d_%H%M%S}.csv")
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["状态", "发件人/收件人", "主题", "日期"])
+            for item in children:
+                writer.writerow(self.mail_tree.item(item, "values"))
+        self.log(f"查询结果已导出到 {path}", "query")
 
     # ---------- 定时调度 ----------
     def _toggle_scheduler(self):
