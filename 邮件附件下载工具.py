@@ -5,7 +5,6 @@
 - 邮件查询（收件箱/已发送）
 - 失败告警、重试、日志持久化
 """
-import imaplib
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 import threading
