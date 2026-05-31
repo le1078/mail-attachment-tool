@@ -9,3 +9,6 @@ config.json
 config_backups/
 *.log
 processed_ids.txt
+
+.coverage
+mail_tool_log.txt

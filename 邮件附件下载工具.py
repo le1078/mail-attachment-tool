@@ -25,7 +25,8 @@ from mail_utils import decode_str, clean_filename
 from imap_backend import (
     connect_imap, test_imap_connection, get_sent_folder_name,
     archive_to_sent, fetch_attachments, query_emails, fetch_email_detail,
-    batch_fetch_email_details, mark_email_as_read, retry_on_network_error
+    batch_fetch_email_details, mark_email_as_read, mark_email_as_unread,
+    retry_on_network_error
 )
 from smtp_backend import send_email, test_smtp_connection
 from export_utils import export_to_excel, export_csv as export_csv_util
@@ -493,6 +494,7 @@ class MailAttachmentTool:
 
         self._tree_context_menu = tk.Menu(self.mail_tree, tearoff=0)
         self._tree_context_menu.add_command(label="标记已读", command=self._mark_selected_as_read)
+        self._tree_context_menu.add_command(label="标记未读", command=self._mark_selected_as_unread)
         self._tree_context_menu.add_command(label="下载所选邮件附件", command=self._download_query_attachment)
         self._tree_context_menu.add_command(label="批量下载所选邮件附件", command=self._batch_download_query_attachments)
         self._tree_context_menu.add_separator()
@@ -516,6 +518,8 @@ class MailAttachmentTool:
                    command=self._download_query_attachment, width=16).pack(side=tk.LEFT, padx=3)
         ttk.Button(detail_btn_frame, text="标记已读",
                    command=self._mark_selected_as_read, width=10).pack(side=tk.LEFT, padx=3)
+        ttk.Button(detail_btn_frame, text="标记未读",
+                   command=self._mark_selected_as_unread, width=10).pack(side=tk.LEFT, padx=3)
         ttk.Button(detail_btn_frame, text="导出CSV",
                    command=self._export_query_csv, width=8).pack(side=tk.LEFT, padx=3)
         ttk.Button(detail_btn_frame, text="导出Excel",
@@ -626,6 +630,7 @@ class MailAttachmentTool:
         self.hist_search_var.trace_add("write", self._on_history_search)
         self.entry_hist_search = ttk.Entry(hist_toolbar, textvariable=self.hist_search_var, width=22)
         self.entry_hist_search.pack(side=tk.LEFT, padx=3)
+        ttk.Button(hist_toolbar, text="查询", command=self._on_history_search_btn, width=6).pack(side=tk.LEFT, padx=2)
 
         ttk.Label(hist_toolbar, text="从:").pack(side=tk.LEFT, padx=(10, 0))
         self.entry_hist_date_from = ttk.Entry(hist_toolbar, width=12, justify=tk.CENTER)
@@ -1521,6 +1526,14 @@ class MailAttachmentTool:
             date_to=self.entry_hist_date_to.get().strip()
         )
 
+    def _on_history_search_btn(self):
+        """查询按钮触发搜索"""
+        self._refresh_history_list(
+            keyword=self.hist_search_var.get(),
+            date_from=self.entry_hist_date_from.get().strip(),
+            date_to=self.entry_hist_date_to.get().strip()
+        )
+
     def _on_history_date_filter(self):
         """日期筛选按钮"""
         self._refresh_history_list(
@@ -1823,6 +1836,65 @@ class MailAttachmentTool:
             self.query_detail_data["seen"] = True
             self._show_mail_detail(self.query_detail_data)
         self.log(f"邮件 {mail_id} 已标记为已读", "query")
+
+    def _mark_selected_as_unread(self):
+        """将当前选中的已读邮件标记为未读（支持多选）"""
+        selection = self.mail_tree.selection()
+        if not selection:
+            messagebox.showinfo("提示", "请先选中邮件")
+            return
+
+        seen_ids = [mid for mid in selection
+                     if self.mail_tree.item(mid, "values") and self.mail_tree.item(mid, "values")[0] == "已读"]
+        if not seen_ids:
+            messagebox.showinfo("提示", "所选邮件均已是未读状态")
+            return
+
+        folder = self.combo_query_folder.get()
+        cfg = self.config
+
+        def _mark_worker():
+            try:
+                imap_user = cfg["email_user"]
+                imap_pass = cfg["email_pass"]
+                actual_folder = folder
+                if folder == "已发送":
+                    sent_user = cfg.get("send_user") or cfg["email_user"]
+                    sent_pass = cfg.get("send_pass") or cfg["email_pass"]
+                    imap_user = sent_user
+                    imap_pass = sent_pass
+
+                mail = connect_imap(cfg["imap_server"], cfg["imap_port"],
+                                    imap_user, imap_pass,
+                                    cfg.get("skip_ssl_verify", False))
+
+                if folder == "已发送":
+                    sent_folder = get_sent_folder_name(mail)
+                    actual_folder = sent_folder or "INBOX"
+
+                success_count = 0
+                for mail_id in seen_ids:
+                    if mark_email_as_unread(mail, actual_folder, mail_id,
+                                            log_func=lambda msg, mid=mail_id: self.root.after(0, lambda: self.log(msg, "query"))):
+                        success_count += 1
+                        self.root.after(0, lambda mid=mail_id: self._on_mark_unread_success(mid))
+                mail.logout()
+                self.root.after(0, lambda: self.log(f"批量标记未读完成: {success_count}/{len(seen_ids)} 封", "query"))
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("错误", f"标记未读失败: {e}"))
+
+        threading.Thread(target=_mark_worker, daemon=True).start()
+
+    def _on_mark_unread_success(self, mail_id):
+        """标记未读成功后更新 UI"""
+        values = list(self.mail_tree.item(mail_id, "values"))
+        if values:
+            values[0] = "未读"
+            self.mail_tree.item(mail_id, values=tuple(values), tags=("unseen",))
+        if self.query_detail_data:
+            self.query_detail_data["seen"] = False
+            self._show_mail_detail(self.query_detail_data)
+        self.log(f"邮件 {mail_id} 已标记为未读", "query")
 
     def _sort_treeview(self, col):
         if self._tree_sort_col == col:

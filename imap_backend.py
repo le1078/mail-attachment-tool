@@ -1014,3 +1014,30 @@ def mark_email_as_read(mail, folder, mail_id, log_func=None):
         if log_func:
             log_func(f"标记已读失败: {e}")
         return False
+
+
+# ==================== 标记未读 ====================
+@retry_on_network_error(max_attempts=3, delay_seconds=2)
+def mark_email_as_unread(mail, folder, mail_id, log_func=None):
+    if " " in folder or "/" in folder or any(ord(c) > 127 for c in folder):
+        select_name = f'"{folder}"'
+    else:
+        select_name = folder
+    try:
+        mail.select(select_name)
+    except Exception:
+        try:
+            mail.select(folder)
+        except Exception:
+            if log_func:
+                log_func(f"无法选择文件夹 {folder}")
+            return False
+    try:
+        mail.store(mail_id.encode() if isinstance(mail_id, str) else mail_id, '-FLAGS', '\\Seen')
+        if log_func:
+            log_func(f"邮件 {mail_id} 已标记为未读")
+        return True
+    except Exception as e:
+        if log_func:
+            log_func(f"标记未读失败: {e}")
+        return False
