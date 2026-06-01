@@ -14,53 +14,57 @@ class HistoryTab(BaseTab):
         self._refresh_history_list()
 
     def build_ui(self):
-        hist_toolbar = ttk.Frame(self.frame)
-        hist_toolbar.pack(fill=tk.X, pady=(0, 3))
+        # 第一行：搜索
+        hist_row1 = ttk.Frame(self.frame)
+        hist_row1.pack(fill=tk.X, pady=(0, 2))
 
-        ttk.Label(hist_toolbar, text="搜索:").pack(side=tk.LEFT)
+        ttk.Label(hist_row1, text="搜索(文件名/主题/发件人):").pack(side=tk.LEFT)
         self.hist_search_var.trace_add("write", self._on_history_search)
         self.entry_hist_search = ttk.Entry(
-            hist_toolbar, textvariable=self.hist_search_var, width=22
+            hist_row1, textvariable=self.hist_search_var, width=22
         )
         self.entry_hist_search.pack(side=tk.LEFT, padx=3)
         ttk.Button(
-            hist_toolbar, text="查询", command=self._on_history_search_btn, width=6
+            hist_row1, text="查询", command=self._on_history_search_btn, width=6
         ).pack(side=tk.LEFT, padx=2)
 
-        ttk.Label(hist_toolbar, text="从:").pack(side=tk.LEFT, padx=(10, 0))
-        self.entry_hist_date_from = ttk.Entry(hist_toolbar, width=12, justify=tk.CENTER)
+        # 第二行：日期筛选
+        hist_row2 = ttk.Frame(self.frame)
+        hist_row2.pack(fill=tk.X, pady=(0, 2))
+
+        ttk.Label(hist_row2, text="从:").pack(side=tk.LEFT, padx=(0, 2))
+        self.entry_hist_date_from = ttk.Entry(hist_row2, width=12, justify=tk.CENTER)
         self.entry_hist_date_from.pack(side=tk.LEFT, padx=2)
         self.entry_hist_date_from.insert(0, "")
-        ttk.Label(hist_toolbar, text="到:").pack(side=tk.LEFT)
-        self.entry_hist_date_to = ttk.Entry(hist_toolbar, width=12, justify=tk.CENTER)
+        ttk.Label(hist_row2, text="到:").pack(side=tk.LEFT)
+        self.entry_hist_date_to = ttk.Entry(hist_row2, width=12, justify=tk.CENTER)
         self.entry_hist_date_to.pack(side=tk.LEFT, padx=2)
         self.entry_hist_date_to.insert(0, "")
         ttk.Label(
-            hist_toolbar, text="(YYYY-MM-DD)", foreground="gray"
+            hist_row2, text="(YYYY-MM-DD)", foreground="gray"
         ).pack(side=tk.LEFT, padx=2)
-
         ttk.Button(
-            hist_toolbar, text="筛选", command=self._on_history_date_filter, width=6
+            hist_row2, text="筛选", command=self._on_history_date_filter, width=6
         ).pack(side=tk.LEFT, padx=3)
         ttk.Button(
-            hist_toolbar, text="重置", command=self._on_history_reset_filter, width=6
+            hist_row2, text="重置", command=self._on_history_reset_filter, width=6
         ).pack(side=tk.LEFT, padx=2)
 
-        ttk.Separator(hist_toolbar, orient=tk.VERTICAL).pack(
-            side=tk.LEFT, padx=8, fill=tk.Y
-        )
+        # 第三行：操作按钮
+        hist_row3 = ttk.Frame(self.frame)
+        hist_row3.pack(fill=tk.X, pady=(2, 0))
 
         ttk.Button(
-            hist_toolbar, text="打开文件夹", width=10,
-            command=self._on_open_history_folder
+            hist_row3, text="刷新", width=8,
+            command=lambda: self._refresh_history_list()
         ).pack(side=tk.RIGHT, padx=2)
         ttk.Button(
-            hist_toolbar, text="清空历史", width=10,
+            hist_row3, text="清空历史", width=10,
             command=self._on_clear_history
         ).pack(side=tk.RIGHT, padx=2)
         ttk.Button(
-            hist_toolbar, text="刷新", width=8,
-            command=lambda: self._refresh_history_list()
+            hist_row3, text="打开文件夹", width=10,
+            command=self._on_open_history_folder
         ).pack(side=tk.RIGHT, padx=2)
 
         self.hist_tree_frame = ttk.Frame(self.frame)
@@ -73,21 +77,21 @@ class HistoryTab(BaseTab):
             self.hist_tree_frame, columns=hist_columns,
             show="headings", selectmode="browse"
         )
-        self.hist_tree.heading("time", text="下载时间", anchor=tk.W)
-        self.hist_tree.heading("filename", text="文件名", anchor=tk.W)
-        self.hist_tree.heading("subject", text="邮件主题", anchor=tk.W)
-        self.hist_tree.heading("sender", text="发件人", anchor=tk.W)
-        self.hist_tree.heading("save_path", text="保存路径", anchor=tk.W)
-        self.hist_tree.heading("size", text="大小", anchor=tk.E)
+        self.hist_tree.heading("time", text="下载时间", anchor=tk.CENTER)
+        self.hist_tree.heading("filename", text="文件名", anchor=tk.CENTER)
+        self.hist_tree.heading("subject", text="邮件主题", anchor=tk.CENTER)
+        self.hist_tree.heading("sender", text="发件人", anchor=tk.CENTER)
+        self.hist_tree.heading("save_path", text="保存路径", anchor=tk.CENTER)
+        self.hist_tree.heading("size", text="大小", anchor=tk.CENTER)
         self.hist_tree.heading("status", text="状态", anchor=tk.CENTER)
 
-        self.hist_tree.column("time", width=140, minwidth=100)
-        self.hist_tree.column("filename", width=160, minwidth=80)
-        self.hist_tree.column("subject", width=180, minwidth=80)
-        self.hist_tree.column("sender", width=150, minwidth=80)
-        self.hist_tree.column("save_path", width=200, minwidth=100)
-        self.hist_tree.column("size", width=80, minwidth=60)
-        self.hist_tree.column("status", width=60, minwidth=50)
+        self.hist_tree.column("time", width=140, minwidth=60, anchor=tk.CENTER, stretch=True)
+        self.hist_tree.column("filename", width=160, minwidth=50, anchor=tk.CENTER, stretch=True)
+        self.hist_tree.column("subject", width=180, minwidth=50, anchor=tk.CENTER, stretch=True)
+        self.hist_tree.column("sender", width=150, minwidth=50, anchor=tk.CENTER, stretch=True)
+        self.hist_tree.column("save_path", width=200, minwidth=60, anchor=tk.CENTER, stretch=True)
+        self.hist_tree.column("size", width=80, minwidth=40, anchor=tk.CENTER, stretch=True)
+        self.hist_tree.column("status", width=60, minwidth=30, anchor=tk.CENTER, stretch=True)
 
         hist_scroll_y = ttk.Scrollbar(
             self.hist_tree_frame, orient=tk.VERTICAL, command=self.hist_tree.yview

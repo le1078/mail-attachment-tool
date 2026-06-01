@@ -515,6 +515,7 @@ class TaskCoordinator:
     ) -> int:
         from pathlib import Path
         from mail_utils import clean_filename
+        import datetime
 
         save_dir = Path(save_folder)
         save_dir.mkdir(parents=True, exist_ok=True)
@@ -540,6 +541,7 @@ class TaskCoordinator:
                     "size": att.get("size", len(payload)),
                     "status": "success",
                     "email_uid": detail.get("id", ""),
+                    "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 })
             self.log_func(f"附件已保存: {clean_name}", "download")
         return count
@@ -587,6 +589,7 @@ class TaskCoordinator:
         from imap_backend import fetch_email_detail
         from imap_backend import get_sent_folder_name
         from mail_utils import clean_filename
+        import datetime
 
         imap_user = self.config["email_user"]
         imap_pass = self.config["email_pass"]
@@ -662,6 +665,7 @@ class TaskCoordinator:
                             "size": att.get("size", len(payload)),
                             "status": "success",
                             "email_uid": mail_id,
+                            "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         })
                     self.log_func(f"附件已保存: {clean_name}", "download")
             return {

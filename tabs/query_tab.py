@@ -16,46 +16,49 @@ class QueryTab(BaseTab, QueryActionsMixin):
         self.build_ui()
 
     def build_ui(self) -> None:
-        query_ctrl1 = ttk.Frame(self.frame)
-        query_ctrl1.pack(fill=tk.X, pady=(0, 2))
+        query_ctrl1_cond = ttk.Frame(self.frame)
+        query_ctrl1_cond.pack(fill=tk.X, pady=(0, 2))
 
-        ttk.Label(query_ctrl1, text="文件夹:").pack(side=tk.LEFT)
+        ttk.Label(query_ctrl1_cond, text="文件夹:").pack(side=tk.LEFT)
         self.query_folder_var = tk.StringVar(value="INBOX")
         self.combo_query_folder = ttk.Combobox(
-            query_ctrl1, width=15, state="readonly",
+            query_ctrl1_cond, width=15, state="readonly",
             values=["INBOX", "已发送"],
         )
         self.combo_query_folder.pack(side=tk.LEFT, padx=3)
         self.combo_query_folder.set("INBOX")
 
-        ttk.Label(query_ctrl1, text="搜索关键词:").pack(side=tk.LEFT, padx=(10, 0))
-        self.entry_query_keyword = ttk.Entry(query_ctrl1, width=20)
+        ttk.Label(query_ctrl1_cond, text="搜索关键词:").pack(side=tk.LEFT, padx=(10, 0))
+        self.entry_query_keyword = ttk.Entry(query_ctrl1_cond, width=20)
         self.entry_query_keyword.pack(side=tk.LEFT, padx=3)
 
         self.var_search_body = tk.BooleanVar(value=False)
         self.chk_search_body = ttk.Checkbutton(
-            query_ctrl1, text="搜索正文", variable=self.var_search_body,
+            query_ctrl1_cond, text="搜索正文", variable=self.var_search_body,
         )
         self.chk_search_body.pack(side=tk.LEFT, padx=3)
 
-        ttk.Label(query_ctrl1, text="已读/未读:").pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Label(query_ctrl1_cond, text="已读/未读:").pack(side=tk.LEFT, padx=(10, 0))
         self.combo_read_filter = ttk.Combobox(
-            query_ctrl1, width=6, state="readonly",
+            query_ctrl1_cond, width=6, state="readonly",
             values=["全部", "已读", "未读"],
         )
         self.combo_read_filter.pack(side=tk.LEFT, padx=3)
         self.combo_read_filter.set("全部")
 
+        query_ctrl1_btn = ttk.Frame(self.frame)
+        query_ctrl1_btn.pack(fill=tk.X, pady=(0, 2))
+
         self.btn_query_mail = ttk.Button(
-            query_ctrl1, text="查询", command=self._do_mail_query, width=8,
+            query_ctrl1_btn, text="查询", command=self._do_mail_query, width=8,
         )
         self.btn_query_mail.pack(side=tk.LEFT, padx=3)
         self.btn_refresh_mail = ttk.Button(
-            query_ctrl1, text="刷新列表", command=self._do_mail_query, width=8,
+            query_ctrl1_btn, text="刷新列表", command=self._do_mail_query, width=8,
         )
         self.btn_refresh_mail.pack(side=tk.LEFT, padx=3)
         self.btn_sent_mail = ttk.Button(
-            query_ctrl1, text="查看已发送", command=self._do_sent_mail_query, width=10,
+            query_ctrl1_btn, text="查看已发送", command=self._do_sent_mail_query, width=10,
         )
         self.btn_sent_mail.pack(side=tk.LEFT, padx=3)
 

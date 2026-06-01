@@ -214,8 +214,7 @@ class QueryActionsMixin:
 
         def on_complete(count):
             self.btn_query_download.config(state=tk.NORMAL, text="下载此邮件附件")
-            messagebox.showinfo("下载完成", f"成功下载 {count} 个附件到:\n{folder}")
-            self.cb.log(f"本次下载了 {count} 个附件", "query")
+            self.cb.log(f"下载完成: 成功下载 {count} 个附件 -> {folder}", "query")
 
         def on_error(exc):
             self.btn_query_download.config(state=tk.NORMAL, text="下载此邮件附件")
@@ -266,13 +265,9 @@ class QueryActionsMixin:
                 f"共 {total_attachments} 个附件", "query",
             )
             self.cb.log("=" * 50, "query")
-            msg = (
-                f"批量下载完成！\n\n{chr(10).join(status_parts)}"
-                f"\n保存目录: {folder}"
-            )
+            self.cb.log(f"批量下载完成: {', '.join(status_parts)}, 保存目录: {folder}", "query")
             if total_attachments == 0:
-                msg += "\n\n(所选邮件均无附件)"
-            messagebox.showinfo("批量下载完成", msg)
+                self.cb.log("所选邮件均无附件", "query")
 
         def on_error(exc):
             self.btn_batch_download.config(state=tk.NORMAL, text="批量下载所选附件")

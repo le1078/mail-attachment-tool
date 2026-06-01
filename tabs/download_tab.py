@@ -180,15 +180,18 @@ class DownloadTab(BaseTab):
         ttk.Label(dl_email_date_frame, text=" (YYYY-MM-DD)", foreground="gray").pack(side=tk.LEFT)
         row += 1
 
-        dl_btn_frame = ttk.Frame(dl_inner)
-        dl_btn_frame.grid(row=row, column=0, columnspan=3, pady=8)
-        ttk.Button(dl_btn_frame, text="立即执行一次", command=self._test_and_run,
+        dl_btn_frame1 = ttk.Frame(dl_inner)
+        dl_btn_frame1.grid(row=row, column=0, columnspan=3, pady=(8, 2))
+        ttk.Button(dl_btn_frame1, text="立即执行一次", command=self._test_and_run,
                    width=14).pack(side=tk.LEFT, padx=3)
-        ttk.Button(dl_btn_frame, text="测试IMAP连接", command=self._test_imap_btn,
+        ttk.Button(dl_btn_frame1, text="测试IMAP连接", command=self._test_imap_btn,
                    width=14).pack(side=tk.LEFT, padx=3)
-        ttk.Button(dl_btn_frame, text="保存配置", command=self._save_download_config,
+
+        dl_btn_frame2 = ttk.Frame(dl_inner)
+        dl_btn_frame2.grid(row=row+1, column=0, columnspan=3, pady=(2, 8))
+        ttk.Button(dl_btn_frame2, text="保存配置", command=self._save_download_config,
                    width=10).pack(side=tk.LEFT, padx=3)
-        ttk.Button(dl_btn_frame, text="清除配置", command=self._clear_download_config,
+        ttk.Button(dl_btn_frame2, text="清除配置", command=self._clear_download_config,
                    width=10).pack(side=tk.LEFT, padx=3)
 
     def _load_config_to_ui(self) -> None:
@@ -353,11 +356,11 @@ class DownloadTab(BaseTab):
         self.cb.log("开始执行...", "download")
 
         def on_complete(count):
-            self.cb.log(f"本次下载了 {count} 个附件", "download")
             if count == 0:
                 self.cb.log("没有新的匹配附件", "download")
+            else:
+                self.cb.log(f"下载完成: 成功下载 {count} 个附件", "download")
             self.cb.log("=" * 50, "download")
-            messagebox.showinfo("下载完成", f"成功下载 {count} 个附件")
 
         def on_error(exc):
             self.cb.log(f"错误: {exc}", "download")

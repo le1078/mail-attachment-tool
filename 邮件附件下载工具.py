@@ -120,6 +120,9 @@ class MailAttachmentTool:
             self._start_scheduler()
 
     def _start_scheduler(self):
+        self.tabs["download"]._save_download_config()
+        self.tabs["send"]._save_send_config()
+        save_config(self.config)
         cfg = self.config
         dl_enabled = cfg.get("schedule_download", {}).get("enabled", False)
         sd_enabled = cfg.get("schedule_send", {}).get("enabled", False)
@@ -299,6 +302,8 @@ class MailAttachmentTool:
             new_config = import_config_from(path)
             self._set_config(new_config)
             save_config(self.config)
+            self.tabs["download"]._load_config_to_ui()
+            self.tabs["send"]._load_config_to_ui()
             self.log(f"配置已导入 -> {path}")
             messagebox.showinfo("导入成功", "配置已从文件导入，请检查各项设置。")
         except Exception as e:

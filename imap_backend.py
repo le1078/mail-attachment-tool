@@ -360,7 +360,8 @@ def fetch_attachments(mail, sender_filter_list, save_folder, log_func,
                                         "save_path": filepath,
                                         "size": os.path.getsize(filepath),
                                         "status": "success",
-                                        "email_uid": mail_id_str
+                                        "email_uid": mail_id_str,
+                                        "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                                     })
                                 except Exception:
                                     pass
@@ -393,7 +394,8 @@ def fetch_attachments(mail, sender_filter_list, save_folder, log_func,
                                     "save_path": filepath,
                                     "size": os.path.getsize(filepath),
                                     "status": "success",
-                                    "email_uid": mail_id_str
+                                    "email_uid": mail_id_str,
+                                    "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                                 })
                             except Exception:
                                 pass

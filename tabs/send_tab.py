@@ -135,15 +135,18 @@ class SendTab(BaseTab):
         self.spin_send_sec.pack(side=tk.LEFT, padx=(2, 5)); self.spin_send_sec.set("0")
         srow += 1
 
-        sd_btn_frame = ttk.Frame(send_inner)
-        sd_btn_frame.grid(row=srow, column=0, columnspan=3, pady=8)
-        ttk.Button(sd_btn_frame, text="立即执行一次", command=self._test_send,
+        sd_btn_frame1 = ttk.Frame(send_inner)
+        sd_btn_frame1.grid(row=srow, column=0, columnspan=3, pady=(8, 2))
+        ttk.Button(sd_btn_frame1, text="立即执行一次", command=self._test_send,
                    width=14).pack(side=tk.LEFT, padx=3)
-        ttk.Button(sd_btn_frame, text="测试SMTP连接", command=self._test_smtp_btn,
+        ttk.Button(sd_btn_frame1, text="测试SMTP连接", command=self._test_smtp_btn,
                    width=14).pack(side=tk.LEFT, padx=3)
-        ttk.Button(sd_btn_frame, text="保存配置", command=self._save_send_config,
+
+        sd_btn_frame2 = ttk.Frame(send_inner)
+        sd_btn_frame2.grid(row=srow+1, column=0, columnspan=3, pady=(2, 8))
+        ttk.Button(sd_btn_frame2, text="保存配置", command=self._save_send_config,
                    width=10).pack(side=tk.LEFT, padx=3)
-        ttk.Button(sd_btn_frame, text="清除配置", command=self._clear_send_config,
+        ttk.Button(sd_btn_frame2, text="清除配置", command=self._clear_send_config,
                    width=10).pack(side=tk.LEFT, padx=3)
 
     def _load_config_to_ui(self):
