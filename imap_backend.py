@@ -278,7 +278,7 @@ def fetch_attachments(mail, sender_filter_list, save_folder, log_func,
             except Exception:
                 continue
 
-        status, msg_data = mail.fetch(mail_id, "(RFC822)")
+        status, msg_data = mail.fetch(mail_id, "(BODY.PEEK[])")
         if status != "OK":
             continue
 
@@ -481,7 +481,7 @@ def query_emails(mail, folder, search_criteria, max_count=50, log_func=None,
         except Exception:
             pass
 
-        status, msg_data = mail.fetch(mail_id, "(RFC822)")
+        status, msg_data = mail.fetch(mail_id, "(BODY.PEEK[])")
         if status != "OK":
             continue
         raw_bytes = None
@@ -524,7 +524,7 @@ def fetch_email_detail(mail, mail_id, log_func=None):
     except Exception:
         pass
 
-    status, msg_data = mail.fetch(mail_id.encode(), "(RFC822)")
+    status, msg_data = mail.fetch(mail_id.encode(), "(BODY.PEEK[])")
     if status != "OK":
         return None
     raw_email_bytes = None
