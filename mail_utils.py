@@ -1,9 +1,12 @@
 import email
+import os
 import re
 from email.header import decode_header
 from email.policy import default
 from pathlib import Path
 from urllib.parse import unquote, unquote_to_bytes
+
+from constants import MAX_FILENAME_LEN
 
 
 def decode_str(s):
@@ -26,11 +29,24 @@ def decode_str(s):
     return "".join(result)
 
 
+_WIN_RESERVED = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
 def clean_filename(name):
-    """清理文件名中的非法字符"""
+    """清理文件名中的非法字符，并处理 Windows 保留名和长度限制。"""
+    name = re.sub(r'[\x00-\x1f\x7f]', "", name)
     name = re.sub(r'[\\/:*?"<>|]', "_", name)
-    name = re.sub(r'[\x00-\x1f]', "", name)
     name = name.strip(" .")
+    if len(name) > MAX_FILENAME_LEN:
+        base, ext = os.path.splitext(name)
+        name = base[:MAX_FILENAME_LEN - len(ext)] + ext
+    base_upper = os.path.splitext(name)[0].upper()
+    if base_upper in _WIN_RESERVED:
+        name = f"_{name}"
     if not name:
         name = "unnamed"
     return name

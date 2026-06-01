@@ -19,10 +19,19 @@ python -m pip install --upgrade pip -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 echo.
 echo [2/4] 安装依赖...
-pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+python -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+if errorlevel 1 (
+    echo [错误] 依赖安装失败！
+    pause
+    exit /b 1
+)
 
 echo.
 echo [3/4] 开始打包...
+if not exist mail_tool.spec (
+    echo 生成 spec 文件...
+    pyi-makespec --onefile --windowed --name "邮件附件自动下载工具" "邮件附件下载工具.py"
+)
 pyinstaller --clean mail_tool.spec
 
 if errorlevel 1 (

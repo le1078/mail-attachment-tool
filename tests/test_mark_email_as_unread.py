@@ -494,7 +494,7 @@ class TestDecodeStr_Round2:
     def test_t44_decode_str_with_recursion_error(self):
         """T44: decode_str handles RecursionError gracefully."""
         # Create a header that would cause recursion
-        with patch("imap_backend.decode_header", side_effect=RecursionError):
+        with patch("mail_utils.decode_header", side_effect=RecursionError):
             result = decode_str("some string")
             assert result == "some string"
 
@@ -513,48 +513,47 @@ class TestUIChangesRound2:
     """
 
     def test_t46_mark_unread_method_exists_in_tool(self):
-        """T46: _mark_selected_as_unread method exists in the main tool class."""
+        """T46: _mark_selected_as_unread method now lives in query_actions.py."""
         import importlib.util
         spec = importlib.util.spec_from_file_location(
-            "tool", os.path.join(PROJECT_ROOT, "邮件附件下载工具.py")
+            "query_actions", os.path.join(PROJECT_ROOT, "tabs", "query_actions.py")
         )
-        # We can't import the file directly because it creates a GUI,
-        # so we check the source code for the method
-        with open(os.path.join(PROJECT_ROOT, "邮件附件下载工具.py"), "r", encoding="utf-8") as f:
+        with open(os.path.join(PROJECT_ROOT, "tabs", "query_actions.py"), "r", encoding="utf-8") as f:
             source = f.read()
         assert "def _mark_selected_as_unread(self)" in source
 
     def test_t47_mark_unread_import_exists(self):
-        """T47: mark_email_as_unread is imported in the main tool file."""
-        with open(os.path.join(PROJECT_ROOT, "邮件附件下载工具.py"), "r", encoding="utf-8") as f:
+        """T47: run_mark_as_unread is called via coordinator in query_actions.py."""
+        with open(os.path.join(PROJECT_ROOT, "tabs", "query_actions.py"), "r", encoding="utf-8") as f:
             source = f.read()
-        assert "mark_email_as_unread" in source
+        assert "run_mark_as_unread" in source
 
     def test_t48_query_button_exists_in_code(self):
-        """T48: Query button for download history exists in the code."""
-        with open(os.path.join(PROJECT_ROOT, "邮件附件下载工具.py"), "r", encoding="utf-8") as f:
+        """T48: Query button exists in query_tab.py and history search button exists."""
+        with open(os.path.join(PROJECT_ROOT, "tabs", "query_tab.py"), "r", encoding="utf-8") as f:
             source = f.read()
         assert 'text="查询"' in source
+        with open(os.path.join(PROJECT_ROOT, "tabs", "history_tab.py"), "r", encoding="utf-8") as f:
+            source = f.read()
         assert "_on_history_search_btn" in source
 
     def test_t49_mark_unread_success_handler_exists(self):
-        """T49: _on_mark_unread_success handler exists."""
-        with open(os.path.join(PROJECT_ROOT, "邮件附件下载工具.py"), "r", encoding="utf-8") as f:
+        """T49: _on_mark_unread_success handler now lives in query_actions.py."""
+        with open(os.path.join(PROJECT_ROOT, "tabs", "query_actions.py"), "r", encoding="utf-8") as f:
             source = f.read()
-        assert "def _on_mark_unread_success(self, mail_id)" in source
+        assert "def _on_mark_unread_success(self, mail_id: str)" in source
 
     def test_t50_context_menu_has_mark_unread(self):
-        """T50: Right-click context menu includes '标记未读' option."""
-        with open(os.path.join(PROJECT_ROOT, "邮件附件下载工具.py"), "r", encoding="utf-8") as f:
+        """T50: Right-click context menu includes '标记未读' option. Now in query_tab.py."""
+        with open(os.path.join(PROJECT_ROOT, "tabs", "query_tab.py"), "r", encoding="utf-8") as f:
             source = f.read()
         assert '"标记未读"' in source
         assert "_tree_context_menu" in source
 
     def test_t51_history_search_btn_calls_refresh(self):
-        """T51: _on_history_search_btn calls _refresh_history_list with correct params."""
-        with open(os.path.join(PROJECT_ROOT, "邮件附件下载工具.py"), "r", encoding="utf-8") as f:
+        """T51: _on_history_search_btn calls _refresh_history_list with correct params. Now in history_tab.py."""
+        with open(os.path.join(PROJECT_ROOT, "tabs", "history_tab.py"), "r", encoding="utf-8") as f:
             source = f.read()
-        # Find the method and verify it calls _refresh_history_list
         idx = source.find("def _on_history_search_btn(self)")
         assert idx != -1
         method_body = source[idx:idx + 300]

@@ -1,5 +1,4 @@
 import json
-import os
 import re
 import sys
 import datetime
@@ -144,72 +143,86 @@ def persist_log_entries(entries):
         pass
 
 
-def validate_config(config):
+def validate_config(config, scenario="all"):
+    """校验配置完整性，按场景分组校验。
+
+    Args:
+        config: 配置字典。
+        scenario: 校验场景，可选 "download" / "send" / "all"。
+            - "download": 仅校验 IMAP/下载相关配置。
+            - "send": 仅校验 SMTP/发送相关配置。
+            - "all": 校验全部配置（默认值，兼容旧调用方）。
+
+    Raises:
+        ValueError: 配置不完整或格式错误时抛出，包含所有错误信息。
+    """
     errors = []
 
-    # 下载配置 - 必填字段
-    if not config.get("imap_server", "").strip():
-        errors.append("下载配置: IMAP服务器地址(imap_server)不能为空")
-    if not isinstance(config.get("imap_port"), int) or config.get("imap_port") <= 0 or config.get("imap_port") > 65535:
-        errors.append("下载配置: IMAP端口(imap_port)必须为1~65535之间的正整数")
-    if not config.get("email_user", "").strip():
-        errors.append("下载配置: 邮箱账号(email_user)不能为空")
-    if not config.get("email_pass", "").strip():
-        errors.append("下载配置: 邮箱密码(email_pass)不能为空")
-    if not config.get("save_folder", "").strip():
-        errors.append("下载配置: 附件保存目录(save_folder)不能为空")
-    if config.get("download_read_status") not in ("all", "unread", "read"):
-        errors.append("下载配置: 读取状态(download_read_status)必须为 all/unread/read 之一")
+    # --- 下载配置 (scenario="download" 或 "all") ---
+    if scenario in ("download", "all"):
+        if not config.get("imap_server", "").strip():
+            errors.append("下载配置: IMAP服务器地址(imap_server)不能为空")
+        if not isinstance(config.get("imap_port"), int) or config.get("imap_port") <= 0 or config.get("imap_port") > 65535:
+            errors.append("下载配置: IMAP端口(imap_port)必须为1~65535之间的正整数")
+        if not config.get("email_user", "").strip():
+            errors.append("下载配置: 邮箱账号(email_user)不能为空")
+        if not config.get("email_pass", "").strip():
+            errors.append("下载配置: 邮箱密码(email_pass)不能为空")
+        if not config.get("save_folder", "").strip():
+            errors.append("下载配置: 附件保存目录(save_folder)不能为空")
+        if config.get("download_read_status") not in ("all", "unseen", "seen"):
+            errors.append("下载配置: 读取状态(download_read_status)必须为 all/unseen/seen 之一")
 
-    # 发送配置 - 必填字段
-    if not config.get("smtp_server", "").strip():
-        errors.append("发送配置: SMTP服务器地址(smtp_server)不能为空")
-    if not isinstance(config.get("smtp_port"), int) or config.get("smtp_port") <= 0 or config.get("smtp_port") > 65535:
-        errors.append("发送配置: SMTP端口(smtp_port)必须为1~65535之间的正整数")
-    if not config.get("send_user", "").strip():
-        errors.append("发送配置: 发件人账号(send_user)不能为空")
-    if not config.get("send_pass", "").strip():
-        errors.append("发送配置: 发件人密码(send_pass)不能为空")
-    if not config.get("send_to", "").strip():
-        errors.append("发送配置: 收件人地址(send_to)不能为空")
-    if config.get("send_attachment_mode") not in ("single", "list"):
-        errors.append("发送配置: 附件模式(send_attachment_mode)必须为 single/list 之一")
+        # 下载筛选 - 日期格式校验
+        if config.get("download_filter_date_enabled"):
+            date_start = config.get("download_filter_date_start", "")
+            date_end = config.get("download_filter_date_end", "")
+            if date_start and not re.match(r'^\d{4}-\d{2}-\d{2}$', date_start):
+                errors.append("下载配置: 筛选开始日期(download_filter_date_start)格式无效，应为YYYY-MM-DD")
+            if date_end and not re.match(r'^\d{4}-\d{2}-\d{2}$', date_end):
+                errors.append("下载配置: 筛选结束日期(download_filter_date_end)格式无效，应为YYYY-MM-DD")
 
-    # 下载筛选 - 日期格式校验
-    if config.get("download_filter_date_enabled"):
-        date_start = config.get("download_filter_date_start", "")
-        date_end = config.get("download_filter_date_end", "")
-        if date_start and not re.match(r'^\d{4}-\d{2}-\d{2}$', date_start):
-            errors.append("下载配置: 筛选开始日期(download_filter_date_start)格式无效，应为YYYY-MM-DD")
-        if date_end and not re.match(r'^\d{4}-\d{2}-\d{2}$', date_end):
-            errors.append("下载配置: 筛选结束日期(download_filter_date_end)格式无效，应为YYYY-MM-DD")
+        # 下载筛选 - 时间格式校验
+        if config.get("download_filter_time_enabled"):
+            time_start = config.get("download_filter_time_start", "")
+            time_end = config.get("download_filter_time_end", "")
+            if time_start and not re.match(r'^\d{2}:\d{2}$', time_start):
+                errors.append("下载配置: 筛选开始时间(download_filter_time_start)格式无效，应为HH:MM")
+            if time_end and not re.match(r'^\d{2}:\d{2}$', time_end):
+                errors.append("下载配置: 筛选结束时间(download_filter_time_end)格式无效，应为HH:MM")
 
-    # 下载筛选 - 时间格式校验
-    if config.get("download_filter_time_enabled"):
-        time_start = config.get("download_filter_time_start", "")
-        time_end = config.get("download_filter_time_end", "")
-        if time_start and not re.match(r'^\d{2}:\d{2}$', time_start):
-            errors.append("下载配置: 筛选开始时间(download_filter_time_start)格式无效，应为HH:MM")
-        if time_end and not re.match(r'^\d{2}:\d{2}$', time_end):
-            errors.append("下载配置: 筛选结束时间(download_filter_time_end)格式无效，应为HH:MM")
+    # --- 发送配置 (scenario="send" 或 "all") ---
+    if scenario in ("send", "all"):
+        if not config.get("smtp_server", "").strip():
+            errors.append("发送配置: SMTP服务器地址(smtp_server)不能为空")
+        if not isinstance(config.get("smtp_port"), int) or config.get("smtp_port") <= 0 or config.get("smtp_port") > 65535:
+            errors.append("发送配置: SMTP端口(smtp_port)必须为1~65535之间的正整数")
+        if not config.get("send_user", "").strip():
+            errors.append("发送配置: 发件人账号(send_user)不能为空")
+        if not config.get("send_pass", "").strip():
+            errors.append("发送配置: 发件人密码(send_pass)不能为空")
+        if not config.get("send_to", "").strip():
+            errors.append("发送配置: 收件人地址(send_to)不能为空")
+        if config.get("send_attachment_mode") not in ("single", "multi", "folder"):
+            errors.append("发送配置: 附件模式(send_attachment_mode)必须为 single/multi/folder 之一")
 
-    # 定时调度 - days列表校验
+    # --- 定时调度配置 (始终校验) ---
     for schedule_key, schedule_label in [("schedule_download", "下载定时"), ("schedule_send", "发送定时")]:
         schedule = config.get(schedule_key, {})
         if schedule.get("enabled", False):
             days = schedule.get("days", [])
-            valid_days = set(range(7))
+            valid_days = set(range(1, 8))
             invalid = [d for d in days if d not in valid_days]
             if invalid:
-                errors.append(f"{schedule_label}: 星期配置包含无效值 {invalid}，必须为0-6之间的整数")
+                errors.append(f"{schedule_label}: 星期配置包含无效值 {invalid}，必须为1-7之间的整数（1=周一，7=周日）")
 
-    # 重试配置
+    # --- 重试配置 (始终校验) ---
     if not isinstance(config.get("retry_count"), int) or config.get("retry_count", 0) < 0:
         errors.append("重试配置: 重试次数(retry_count)必须为非负整数")
     if not isinstance(config.get("retry_interval_minutes"), int) or config.get("retry_interval_minutes", 0) < 1:
         errors.append("重试配置: 重试间隔(retry_interval_minutes)必须为正整数")
 
-    # 日志导出 - 定时字段校验
+    # --- 日志导出配置 (始终校验) ---
     if config.get("log_export_enabled", False):
         if not config.get("log_export_folder", "").strip():
             errors.append("日志导出: 已启用但导出目录(log_export_folder)未设置")
@@ -218,86 +231,7 @@ def validate_config(config):
         raise ValueError("\n".join(errors))
 
 
-# ==================== 下载历史记录管理 ====================
-HISTORY_FILE = Path(__file__).parent / "download_history.json"
-MAX_HISTORY_RECORDS = 2000
-import threading as _threading
-
-_history_lock = _threading.Lock()
-
-
-def load_history():
-    """加载全部下载历史记录，返回按时间倒序排列的列表"""
-    if not HISTORY_FILE.exists():
-        return []
-    try:
-        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-            data = f.read().strip()
-        if not data:
-            return []
-        records = json.loads(data)
-        if not isinstance(records, list):
-            return []
-        # 按时间倒序排列
-        records.sort(key=lambda r: r.get("time", ""), reverse=True)
-        return records
-    except Exception:
-        return []
-
-
-def _atomic_write(records):
-    """原子写入：先写临时文件，成功后再替换"""
-    tmp_path = HISTORY_FILE.with_suffix(".tmp")
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(records, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, HISTORY_FILE)
-    except Exception:
-        try:
-            if tmp_path.exists():
-                tmp_path.unlink()
-        except Exception:
-            pass
-        raise
-
-
-def save_history(records):
-    """保存历史记录到文件（覆盖写入），自动裁剪超限部分"""
-    with _history_lock:
-        if len(records) > MAX_HISTORY_RECORDS:
-            records = records[:MAX_HISTORY_RECORDS]
-        _atomic_write(records)
-
-
-def add_history_record(record):
-    """添加一条下载历史记录。线程安全，自动裁剪超限。
-    
-    record 必须包含以下字段：
-        time: str      下载时间 "YYYY-MM-DD HH:MM:SS"
-        filename: str  文件名
-        subject: str   邮件主题
-        sender: str    发件人
-        save_path: str 保存路径
-        size: int      文件大小(字节)，未知时 -1
-        status: str    "success" 或 "failed"
-        email_uid: str IMAP UID（可选，默认空字符串）
-    """
-    record.setdefault("email_uid", "")
-    record.setdefault("sender", "")
-    record.setdefault("subject", "")
-    with _history_lock:
-        records = load_history()
-        records.insert(0, record)
-        save_history(records)
-
-
-def clear_history():
-    """清空所有下载历史记录"""
-    with _history_lock:
-        if HISTORY_FILE.exists():
-            try:
-                HISTORY_FILE.unlink()
-            except Exception:
-                pass
-        # 写入空数组确保文件干净
-        _atomic_write([])
+from download_history import (
+    load_history, add_history_record, clear_history, save_history,
+    MAX_HISTORY_RECORDS, HISTORY_FILE
+)
